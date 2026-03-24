@@ -121,7 +121,13 @@ Jianhong_labelimg/
 
 ## 快速开始
 
-### 安装方式
+### 方式一：直接运行 (推荐)
+
+1.  从 [GitHub Releases](https://github.com/2859363572/Jianhong_labelimg/releases) 页面下载最新的 `Jianhong_labelimg_vX.X.X.exe` 文件。
+2.  双击运行即可，无需安装 Python 环境。
+
+### 方式二：从源码启动
+
 1. 克隆仓库：
    ```bash
    git clone https://github.com/2859363572/Jianhong_labelimg.git
