@@ -121,26 +121,63 @@ Jianhong_labelimg/
 
 ## 快速开始
 
-### 方式一：直接运行 (推荐)
+### 方式一：使用发行版 (推荐)
 
-1.  从 [GitHub Releases](https://github.com/2859363572/Jianhong_labelimg/releases) 页面下载最新的 `Jianhong_labelimg_vX.X.X.exe` 文件。
-2.  双击运行即可，无需安装 Python 环境。
+1.  前往本项目的 [GitHub Releases](https://github.com/2859363572/Jianhong_labelimg/releases) 页面。
+2.  下载最新版本的 `Jianhong_labelimg-vX.X.X-windows.zip` 压缩包。
+3.  解压后，进入文件夹，双击运行 `labelImg.exe` 即可。
 
 ### 方式二：从源码启动
 
-1. 克隆仓库：
-   ```bash
-   git clone https://github.com/2859363572/Jianhong_labelimg.git
-   cd Jianhong_labelimg
-   ```
-2. 安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. 启动程序：
-   ```bash
-   python run.py
-   ```
+1.  **环境准备**: 确保您已安装 Python (推荐 3.9+ 版本) 和 Git。
+
+2.  **克隆仓库**:
+    ```bash
+    git clone https://github.com/2859363572/Jianhong_labelimg.git
+    cd Jianhong_labelimg
+    ```
+
+3.  **创建并激活虚拟环境**:
+    ```bash
+    # 创建虚拟环境
+    python -m venv .venv
+    # 激活虚拟环境 (Windows)
+    .venv\Scripts\activate
+    ```
+
+4.  **安装依赖**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+5.  **启动程序**:
+    ```bash
+    python run.py
+    ```
+
+## 打包说明
+
+如果需要自行修改源码并打包，请遵循以下步骤。本项目使用了 `PyInstaller` 进行打包，并提供了一个优化过的 `run.spec` 配置文件来处理 `PyQt5` 的复杂依赖。
+
+1.  **安装 PyInstaller**:
+    ```bash
+    pip install pyinstaller
+    ```
+
+2.  **执行打包**:
+    ```bash
+    # -w: 无控制台窗口
+    # -D: 单文件夹模式 (更稳定)
+    # -i: 指定图标
+    pyinstaller run.py -wD -i "img/market-bull.ico"
+    ```
+    或者，使用我们已经优化好的 `.spec` 文件（推荐）：
+    ```bash
+    # 此方法会使用 run.spec 文件中的高级配置，可靠性更高
+    pyinstaller run.spec
+    ```
+
+3.  **结果**: 打包好的程序位于 `dist/labelImg` 文件夹下。
 
 ## 快捷键参考
 

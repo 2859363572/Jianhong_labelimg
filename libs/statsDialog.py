@@ -20,12 +20,12 @@ class StatisticsDialog(QDialog):
         # 标题和日期
         today = datetime.now().strftime("%Y-%m-%d")
         header = QLabel(f"当日统计 ({today})")
-        header.setStyleSheet("font-size: 16px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        header.setObjectName("StatsHeader")
         layout.addWidget(header)
         
         # 说明
         info = QLabel("注：统计数据每日凌晨 12:00 自动清空。相同路径下的图片将分组计数。")
-        info.setStyleSheet("color: #666; font-size: 12px; margin-bottom: 10px;")
+        info.setObjectName("StatsInfo")
         layout.addWidget(info)
 
         # 表格显示明细
@@ -41,7 +41,7 @@ class StatisticsDialog(QDialog):
         
         # 总计显示
         self.total_label = QLabel("总计计数: 0")
-        self.total_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #d32f2f; margin-top: 10px;")
+        self.total_label.setObjectName("StatsTotal")
         layout.addWidget(self.total_label)
         
         # 底部按钮

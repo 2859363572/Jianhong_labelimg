@@ -66,6 +66,49 @@ class Canvas(QWidget):
 
         # initialisation for panning
         self.pan_initial_pos = QPoint()
+        
+        # Tech background effect properties
+        self.tech_particles = []
+        self.tech_timer = QTimer(self)
+        self.tech_timer.timeout.connect(self._update_tech_effect)
+        self._init_tech_particles()
+        
+        # ensure timer starts
+        self.tech_timer.start(30)  # ~30 FPS for background effect
+
+    def _init_tech_particles(self):
+        import random
+        self.tech_particles = []
+        for _ in range(80):  # Increase particle count for a denser effect
+            # [x, y, dx, dy, radius]
+            self.tech_particles.append([
+                random.uniform(0, 1500), 
+                random.uniform(0, 1000),
+                random.uniform(-0.8, 0.8),
+                random.uniform(-0.8, 0.8),
+                random.uniform(1.5, 4.0)
+            ])
+
+    def _update_tech_effect(self):
+        if not self.pixmap.isNull():
+            return  # Stop updating if an image is loaded
+            
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0:
+            return
+            
+        for p in self.tech_particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            
+            # Smooth wrapping instead of bouncing to make it feel like an infinite space
+            if p[0] < -50: p[0] = w + 50
+            elif p[0] > w + 50: p[0] = -50
+            
+            if p[1] < -50: p[1] = h + 50
+            elif p[1] > h + 50: p[1] = -50
+            
+        self.update()
 
     def set_drawing_color(self, qcolor):
         self.drawing_line_color = qcolor
@@ -507,8 +550,10 @@ class Canvas(QWidget):
             self.bounded_move_shape(shape, point + offset)
 
     def paintEvent(self, event):
-        if not self.pixmap:
-            return super(Canvas, self).paintEvent(event)
+        if self.pixmap.isNull():
+            return self._paint_tech_background(event)
+            
+        super(Canvas, self).paintEvent(event)
 
         p = self._painter
         p.begin(self)
@@ -558,6 +603,75 @@ class Canvas(QWidget):
             pal.setColor(self.backgroundRole(), QColor(232, 232, 232, 255))
             self.setPalette(pal)
 
+        p.end()
+
+    def _paint_tech_background(self, event):
+        """Paint dynamic tech background when no image is loaded"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        
+        # Fill background with a very subtle gradient for depth
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0.0, QColor("#F0F4F8"))
+        gradient.setColorAt(1.0, QColor("#E9ECEF"))
+        p.fillRect(self.rect(), gradient)
+        
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0 or not self.tech_particles:
+            p.end()
+            return
+            
+        import math
+        
+        # Draw particles and connections
+        max_dist = 180.0
+        
+        # Draw connections
+        for i in range(len(self.tech_particles)):
+            for j in range(i + 1, len(self.tech_particles)):
+                p1 = self.tech_particles[i]
+                p2 = self.tech_particles[j]
+                
+                dx = p1[0] - p2[0]
+                dy = p1[1] - p2[1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                if dist < max_dist:
+                    # Calculate alpha based on distance, closer = more opaque
+                    alpha_ratio = 1.0 - (dist / max_dist)
+                    # Non-linear fade out for more tech-like glowing webs
+                    alpha = int(255 * (alpha_ratio ** 1.5)) 
+                    # Use a vibrant tech blue for connections
+                    p.setPen(QPen(QColor(33, 150, 243, int(alpha * 0.5)), 1.2))
+                    p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
+                    
+        # Draw particles
+        p.setPen(Qt.NoPen)
+        for particle in self.tech_particles:
+            # Draw glow
+            p.setBrush(QBrush(QColor(33, 150, 243, 60)))
+            p.drawEllipse(QPointF(particle[0], particle[1]), particle[4]*2.5, particle[4]*2.5)
+            # Draw core (white-ish blue)
+            p.setBrush(QBrush(QColor(100, 181, 246, 220)))
+            p.drawEllipse(QPointF(particle[0], particle[1]), particle[4], particle[4])
+            
+        # Draw center text with a slight shadow effect
+        font = p.font()
+        font.setPointSize(20)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
+        p.setFont(font)
+        
+        text = "Open an Image or Directory to Start"
+        text_rect = p.boundingRect(self.rect(), Qt.AlignCenter, text)
+        
+        # Shadow
+        p.setPen(QColor(0, 0, 0, 20))
+        p.drawText(text_rect.translated(2, 2), Qt.AlignCenter, text)
+        
+        # Main text
+        p.setPen(QColor(100, 120, 140))
+        p.drawText(text_rect, Qt.AlignCenter, text)
         p.end()
 
     def transform_pos(self, point):
@@ -692,6 +806,11 @@ class Canvas(QWidget):
 
         return self.shapes[-1]
 
+    def pop_shape(self):
+        if self.shapes:
+            return self.shapes.pop()
+        return None
+
     def undo_last_line(self):
         assert self.shapes
         self.current = self.shapes.pop()
@@ -708,6 +827,7 @@ class Canvas(QWidget):
     def load_pixmap(self, pixmap):
         self.pixmap = pixmap
         self.shapes = []
+        self.tech_timer.stop() # 停止特效
         self.repaint()
 
     def load_shapes(self, shapes):
@@ -741,6 +861,7 @@ class Canvas(QWidget):
         self.shapes = []
         self.current = None
         self.line.points = []
+        self.tech_timer.start(50) # 重新开启特效
         self.update()
 
     def set_drawing_shape_to_square(self, status):

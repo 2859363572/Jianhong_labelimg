@@ -52,6 +52,7 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+from libs.theme import apply_theme
 
 __appname__ = 'labelImg'
 
@@ -236,20 +237,31 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Directory display
         self.image_dir_label = QLabel('图片目录: 未设置')
-        self.image_dir_label.setStyleSheet("font-weight: bold; color: #1e88e5; padding: 5px; background-color: #f5f5f5; border-radius: 4px;")
+        self.image_dir_label.setObjectName("ImageDirLabel")
+        self.image_dir_label.setAlignment(Qt.AlignCenter)
+        
         self.annotation_dir_label = QLabel('保存目录: 未设置')
-        self.annotation_dir_label.setStyleSheet("font-weight: bold; color: #43a047; padding: 5px; background-color: #f5f5f5; border-radius: 4px;")
+        self.annotation_dir_label.setObjectName("AnnotationDirLabel")
+        self.annotation_dir_label.setAlignment(Qt.AlignCenter)
+        
         self.daily_total_label = QLabel('今日总计数: 0')
-        self.daily_total_label.setStyleSheet("font-weight: bold; color: #d32f2f; padding: 5px; background-color: #f5f5f5; border-radius: 4px;")
+        self.daily_total_label.setObjectName("DailyTotalLabel")
+        self.daily_total_label.setAlignment(Qt.AlignCenter)
         
         dir_layout = QHBoxLayout()
-        dir_layout.addWidget(self.image_dir_label)
-        dir_layout.addWidget(self.annotation_dir_label)
-        dir_layout.addWidget(self.daily_total_label)
+        dir_layout.setContentsMargins(10, 10, 10, 10)
+        dir_layout.setSpacing(15)
+        dir_layout.addWidget(self.image_dir_label, 1)
+        dir_layout.addWidget(self.annotation_dir_label, 1)
+        dir_layout.addWidget(self.daily_total_label, 1)
+        
         dir_container = QWidget()
+        dir_container.setObjectName("DirContainer")
         dir_container.setLayout(dir_layout)
 
         central_layout = QVBoxLayout()
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
         central_layout.addWidget(dir_container)
         central_layout.addWidget(scroll)
         central_widget = QWidget()
@@ -765,9 +777,11 @@ class MainWindow(QMainWindow, WindowMixin):
     def set_dirty(self):
         self.dirty = True
         self.actions.save.setEnabled(True)
-        # Auto save all operations if enabled
+        # Auto save operations if enabled
         try:
-            if hasattr(self, 'auto_save_all') and self.auto_save_all.isChecked():
+            # Original auto_saving or custom auto_save_all
+            if (hasattr(self, 'auto_save_all') and self.auto_save_all.isChecked()) or \
+               (hasattr(self, 'auto_saving') and self.auto_saving.isChecked()):
                 self.save_file()
         except Exception:
             # If saving fails unexpectedly, keep the app responsive
@@ -833,6 +847,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.image_data = None
         self.label_file = None
         self.canvas.reset_state()
+        self.canvas.pixmap = QPixmap() # trigger background animation
+        self.canvas.tech_timer.start(50)
         self.label_coordinates.clear()
         self.combo_box.cb.clear()
 
@@ -1189,7 +1205,8 @@ class MainWindow(QMainWindow, WindowMixin):
             if text not in self.label_hist:
                 self.label_hist.append(text)
         else:
-            # self.canvas.undoLastLine()
+            # User cancelled the label dialog, remove the last shape added in Canvas.finalise
+            self.canvas.pop_shape()
             self.canvas.reset_all_lines()
 
     def scroll_request(self, delta, orientation):
@@ -1364,6 +1381,9 @@ class MainWindow(QMainWindow, WindowMixin):
         Converts image counter to string representation.
         """
         if not self.m_img_list:
+            self.canvas.clear()
+            self.canvas.pixmap = QPixmap() # ensure pixmap is completely null to show animation
+            self.canvas.tech_timer.start(50)
             return '[0 / 0]'
         
         total_images = len(self.m_img_list)
@@ -1604,12 +1624,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.discard_drawing()
         # Proceeding prev image without dialog if having any label
         if self.auto_saving.isChecked():
-            if self.default_save_dir is not None:
-                if self.dirty is True:
-                    self.save_file()
-            else:
-                self.change_save_dir_dialog()
-                return
+            if self.dirty is True:
+                self.save_file()
 
         if not self.may_continue():
             return
@@ -1630,12 +1646,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.discard_drawing()
         # Proceeding prev image without dialog if having any label
         if self.auto_saving.isChecked():
-            if self.default_save_dir is not None:
-                if self.dirty is True:
-                    self.save_file()
-            else:
-                self.change_save_dir_dialog()
-                return
+            if self.dirty is True:
+                self.save_file()
 
         if not self.may_continue():
             return
@@ -1677,19 +1689,20 @@ class MainWindow(QMainWindow, WindowMixin):
                 image_file_name = os.path.basename(self.file_path)
                 saved_file_name = os.path.splitext(image_file_name)[0]
                 saved_path = os.path.join(ustr(self.default_save_dir), saved_file_name)
-                self._save_file(saved_path)
+                return self._save_file(saved_path)
         else:
             image_file_dir = os.path.dirname(self.file_path)
             image_file_name = os.path.basename(self.file_path)
             saved_file_name = os.path.splitext(image_file_name)[0]
             saved_path = os.path.join(image_file_dir, saved_file_name)
-            self._save_file(saved_path if self.label_file
-                            else self.save_file_dialog(remove_ext=False))
+            return self._save_file(saved_path if self.label_file
+                                  else self.save_file_dialog(remove_ext=False))
+        return False
 
     def save_file_as(self, _value=False):
         self.discard_drawing()
         assert not self.image.isNull(), "cannot save empty image"
-        self._save_file(self.save_file_dialog())
+        return self._save_file(self.save_file_dialog())
 
     def save_file_dialog(self, remove_ext=True):
         caption = '%s - Choose File' % __appname__
@@ -1715,10 +1728,12 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.set_clean()
                 self.statusBar().showMessage('Saved to  %s' % annotation_file_path)
                 self.statusBar().show()
+                return True
         except Exception as e:
             self.statusBar().showMessage('保存失败: 权限不足或文件被占用')
             self.statusBar().show()
             print('保存标注文件失败: {}'.format(e))
+        return False
 
     def close_file(self, _value=False):
         if not self.may_continue():
@@ -1763,8 +1778,7 @@ class MainWindow(QMainWindow, WindowMixin):
             if discard_changes == QMessageBox.No:
                 return True
             elif discard_changes == QMessageBox.Yes:
-                self.save_file()
-                return True
+                return self.save_file()
             else:
                 return False
 
@@ -2119,6 +2133,9 @@ def get_main_app(argv=[]):
     args.image_dir = args.image_dir and os.path.normpath(args.image_dir)
     args.class_file = args.class_file and os.path.normpath(args.class_file)
     args.save_dir = args.save_dir and os.path.normpath(args.save_dir)
+
+    # Apply modern UI theme
+    apply_theme(app)
 
     # Usage : labelImg.py image classFile saveDir
     win = MainWindow(args.image_dir,
