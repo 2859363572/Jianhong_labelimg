@@ -1,0 +1,27 @@
+# labelImg 项目依赖文件
+# GUI框架
+PyQt5>=5.15.0
+
+# XML处理
+lxml>=4.6.0
+
+# 哈希算法（用于颜色生成）
+xxhash>=2.0.0
+
+# 图像处理
+Pillow>=8.0.0
+
+# 打包工具（可选，用于生成exe）
+PyInstaller>=4.0
+
+# 数据处理（如果需要处理大量标注数据）
+numpy>=1.20.0
+pandas>=1.3.0
+
+# 可视化增强（可选）
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+# 开发工具（可选）
+setuptools>=50.0.0
+wheel>=0.36.0
