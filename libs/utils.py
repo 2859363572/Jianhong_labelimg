@@ -1,9 +1,9 @@
 from math import sqrt
 from libs.ustr import ustr
-import hashlib
 import xxhash
 import re
 import sys
+import os
 import colorsys
 import random
 
@@ -19,6 +19,10 @@ except ImportError:
 
 
 def new_icon(icon):
+    # 优先使用相对路径的图标文件，fallback到资源图标
+    icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'img', '{}.ico'.format(icon))
+    if os.path.exists(icon_path):
+        return QIcon(icon_path)
     return QIcon(':/' + icon)
 
 

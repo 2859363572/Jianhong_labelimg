@@ -243,12 +243,19 @@ class Canvas(QWidget):
                 self.parent().window().label_coordinates.setText(
                         'Width: %d, Height: %d / X: %d; Y: %d' % (current_width, current_height, pos.x(), pos.y()))
             else:
-                # pan
-                delta_x = pos.x() - self.pan_initial_pos.x()
-                delta_y = pos.y() - self.pan_initial_pos.y()
-                self.scrollRequest.emit(delta_x, Qt.Horizontal)
-                self.scrollRequest.emit(delta_y, Qt.Vertical)
-                self.update()
+                # pan - directly move scrollbars by pixel delta
+                screen_pos = ev.localPos()
+                if not hasattr(self, '_prev_pan_screen') or self._prev_pan_screen is None:
+                    self._prev_pan_screen = screen_pos
+                delta_x = screen_pos.x() - self._prev_pan_screen.x()
+                delta_y = screen_pos.y() - self._prev_pan_screen.y()
+                self._prev_pan_screen = screen_pos
+                h_bar = self.parent().window().scroll_bars[Qt.Horizontal]
+                v_bar = self.parent().window().scroll_bars[Qt.Vertical]
+                if h_bar:
+                    h_bar.setValue(int(h_bar.value() - delta_x))
+                if v_bar:
+                    v_bar.setValue(int(v_bar.value() - delta_y))
             return
 
         # Just hovering over the canvas, 2 possibilities:
@@ -302,6 +309,10 @@ class Canvas(QWidget):
             if self.drawing():
                 self.handle_drawing(pos)
             else:
+                window = self.parent().window()
+                if getattr(window, '_sam_mode', False) and getattr(window, '_sam_predictor', None):
+                    window._sam_click(pos.x(), pos.y())
+                    return
                 selection = self.select_shape_point(pos)
                 self.prev_point = pos
 
@@ -309,9 +320,10 @@ class Canvas(QWidget):
                     # pan
                     QApplication.setOverrideCursor(QCursor(Qt.OpenHandCursor))
                     self.pan_initial_pos = pos
+                    self._prev_pan_screen = ev.localPos()
                 else:
                     # 记录移动前的状态用于撤回
-                    self.parent().window().save_undo_snapshot()
+                    window.save_undo_snapshot()
 
         elif ev.button() == Qt.RightButton and self.editing():
             self.select_shape_point(pos)
@@ -337,7 +349,8 @@ class Canvas(QWidget):
             if self.drawing():
                 self.handle_drawing(pos)
             else:
-                # pan
+                # pan end
+                self._prev_pan_screen = None
                 QApplication.restoreOverrideCursor()
 
     def end_move(self, copy=False):
@@ -586,12 +599,12 @@ class Canvas(QWidget):
             p.setPen(self.drawing_rect_color)
             brush = QBrush(Qt.BDiagPattern)
             p.setBrush(brush)
-            p.drawRect(left_top.x(), left_top.y(), rect_width, rect_height)
+            p.drawRect(int(left_top.x()), int(left_top.y()), int(rect_width), int(rect_height))
 
         if self.drawing() and not self.prev_point.isNull() and not self.out_of_pixmap(self.prev_point):
             p.setPen(QColor(0, 0, 0))
-            p.drawLine(self.prev_point.x(), 0, self.prev_point.x(), self.pixmap.height())
-            p.drawLine(0, self.prev_point.y(), self.pixmap.width(), self.prev_point.y())
+            p.drawLine(int(self.prev_point.x()), 0, int(self.prev_point.x()), self.pixmap.height())
+            p.drawLine(0, int(self.prev_point.y()), self.pixmap.width(), int(self.prev_point.y()))
 
         self.setAutoFillBackground(True)
         if self.verified:

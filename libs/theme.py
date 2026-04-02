@@ -236,22 +236,26 @@ def apply_theme(app):
         spacing: 8px;
         font-size: 13px;
         color: #333333;
+        padding: 2px 0px;
     }
     QCheckBox::indicator {
-        width: 18px;
-        height: 18px;
+        width: 16px;
+        height: 16px;
         border: 2px solid #BDBDBD;
-        border-radius: 4px;
+        border-radius: 3px;
         background-color: #FFFFFF;
     }
     QCheckBox::indicator:hover {
-        border: 2px solid #64B5F6;
+        border: 2px solid #42A5F5;
         background-color: #F5F5F5;
     }
     QCheckBox::indicator:checked {
-        border: 2px solid #2196F3;
-        background-color: #2196F3;
-        image: url(libs/resources/icons/check.png); /* Assume default Qt check mark behavior if image not found */
+        border: 2px solid #1976D2;
+        background-color: #1976D2;
+    }
+    QCheckBox::indicator:checked:hover {
+        border: 2px solid #1565C0;
+        background-color: #1565C0;
     }
 
     /* Inputs */

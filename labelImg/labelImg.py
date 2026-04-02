@@ -147,6 +147,9 @@ class MainWindow(QMainWindow, WindowMixin):
         self.image = QImage()
         self.file_path = ustr(default_filename)
         self.last_open_dir = None
+        self._pixmap_cache = {}
+        self._sam_predictor = None
+        self._sam_mode = False
         self.recent_files = []
         self.max_recent = 7
         self.line_color = None
@@ -172,16 +175,20 @@ class MainWindow(QMainWindow, WindowMixin):
         use_default_label_container = QWidget()
         use_default_label_container.setLayout(use_default_label_qhbox_layout)
 
-        # Create a widget for edit and diffc button
-        self.diffc_button = QCheckBox(get_str('useDifficult'))
+        self.single_target_checkbox = QCheckBox('单目标模式')
+        self.single_target_checkbox.setChecked(settings.get(SETTING_SINGLE_TARGET, False))
+        self.fast_annotate_checkbox = QCheckBox('快速标注')
+        self.fast_annotate_checkbox.setChecked(settings.get(SETTING_FAST_ANNOTATE, False))
+        self.diffc_button = QCheckBox()
         self.diffc_button.setChecked(False)
-        self.diffc_button.stateChanged.connect(self.button_state)
+        self.diffc_button.setVisible(False)
         self.edit_button = QToolButton()
         self.edit_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         # Add some of widgets to list_layout
         list_layout.addWidget(self.edit_button)
-        list_layout.addWidget(self.diffc_button)
+        list_layout.addWidget(self.single_target_checkbox)
+        list_layout.addWidget(self.fast_annotate_checkbox)
         list_layout.addWidget(use_default_label_container)
 
         # Create and add combobox for showing unique labels in group
@@ -309,6 +316,8 @@ class MainWindow(QMainWindow, WindowMixin):
                               'Alt+2', 'copy', '将选中标签复制到接下来25帧')
         copy_next_custom = action('自定义复制到下N帧', self.copy_selected_labels_custom,
                                   'Alt+C', 'copy', '自定义复制选中标签到后续N帧')
+        smart_copy = action('智能复制相似帧', self.smart_copy_similar,
+                            'Alt+S', 'copy', '自动检测相似帧并复制选中标注')
 
         open_next_image = action(get_str('nextImg'), self.open_next_image,
                                  'd', 'next', get_str('nextImgDetail'))
@@ -477,7 +486,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.actions.editMenu = (
             edit, copy, delete, undo,
             None, color1, self.draw_squares_option,
-            None, copy_next_5, copy_next_10, copy_next_25, copy_next_custom
+            None, copy_next_5, copy_next_10, copy_next_25, copy_next_custom,
+            None, smart_copy
         )
 
         self.menus = Struct(
@@ -509,8 +519,16 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.setChecked(settings.get(SETTING_PAINT_LABEL, False))
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
+        yolo_predict_action = QAction('YOLO 模型预标注', self)
+        yolo_predict_action.setShortcut('Ctrl+Y')
+        yolo_predict_action.triggered.connect(self.show_yolo_predict_dialog)
+
+        sam_action = QAction('SAM 半自动标注', self)
+        sam_action.setShortcut('Ctrl+Shift+Y')
+        sam_action.triggered.connect(self.show_sam_dialog)
+
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, None, yolo_predict_action, sam_action, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut, custom_shortcut, show_stats))
         add_actions(self.menus.view, (
             self.auto_saving,
@@ -902,6 +920,79 @@ class MainWindow(QMainWindow, WindowMixin):
     def show_shortcuts_dialog(self):
         self.show_tutorial_dialog(browser='default', link='https://github.com/tzutalin/labelImg#Hotkeys')
 
+    def show_yolo_predict_dialog(self):
+        from libs.yolo_predict_dialog import YOLOPredictDialog
+        dialog = YOLOPredictDialog(self, parent=self)
+        dialog.exec_()
+
+    def show_sam_dialog(self):
+        from libs.sam_dialog import SAMDialog
+        dialog = SAMDialog(self, parent=self)
+        dialog.exec_()
+
+    def _sam_click(self, x, y):
+        if not hasattr(self, '_sam_predictor') or self._sam_predictor is None:
+            return
+        import numpy as np
+        from PyQt5.QtCore import QPointF
+        from libs.shape import Shape
+        from libs.utils import generate_color_by_text
+        self.save_undo_snapshot()
+        mask = self._sam_predictor.predict_box([x - 50, y - 50, x + 50, y + 50])
+        if mask is None:
+            return
+        bbox = self._sam_predictor.mask_to_bbox(mask)
+        if bbox is None:
+            return
+        x1, y1, x2, y2 = bbox
+        label = self.label_dialog.pop_up(text='sam_target')
+        if not label:
+            return
+        shape = Shape(label=label)
+        shape.add_point(QPointF(x1, y1))
+        shape.add_point(QPointF(x2, y1))
+        shape.add_point(QPointF(x2, y2))
+        shape.add_point(QPointF(x1, y2))
+        shape.close()
+        shape.line_color = generate_color_by_text(label)
+        shape.fill_color = generate_color_by_text(label)
+        self.canvas.shapes.append(shape)
+        self.add_label(shape)
+        self.set_dirty()
+        self.canvas.update()
+
+    def load_yolo_detections(self, detections):
+        from PyQt5.QtCore import QPointF
+        from libs.shape import Shape
+        from libs.utils import generate_color_by_text
+        self.save_undo_snapshot()
+        for det in detections:
+            shape = Shape(label=det['label'])
+            for x, y in det['points']:
+                shape.add_point(QPointF(x, y))
+            shape.close()
+            shape.line_color = generate_color_by_text(det['label'])
+            shape.fill_color = generate_color_by_text(det['label'])
+            self.canvas.shapes.append(shape)
+            self.add_label(shape)
+        self.set_dirty()
+        self.canvas.update()
+
+    def hasAnnotationFile(self, img_path):
+        if not img_path:
+            return False
+        if self.default_save_dir:
+            base = os.path.splitext(os.path.basename(img_path))[0]
+            for ext in [XML_EXT, TXT_EXT, JSON_EXT]:
+                if os.path.isfile(os.path.join(self.default_save_dir, base + ext)):
+                    return True
+        else:
+            base_name = os.path.splitext(img_path)[0]
+            for ext in ['.xml', '.txt', '.json']:
+                if os.path.exists(base_name + ext):
+                    return True
+        return False
+
     def create_shape(self):
         assert self.beginner()
         self.canvas.set_editing(False)
@@ -1039,7 +1130,6 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def remove_label(self, shape):
         if shape is None:
-            # print('rm empty label')
             return
         if shape in self.shapes_to_items:
             item = self.shapes_to_items[shape]
@@ -1048,6 +1138,9 @@ class MainWindow(QMainWindow, WindowMixin):
             if item in self.items_to_shapes:
                 del self.items_to_shapes[item]
             self.update_combo_box()
+        if shape in self.canvas.shapes:
+            self.canvas.shapes.remove(shape)
+            self.canvas.update()
 
     def load_labels(self, shapes):
         s = []
@@ -1195,6 +1288,13 @@ class MainWindow(QMainWindow, WindowMixin):
             generate_color = generate_color_by_text(text)
             shape = self.canvas.set_last_label(text, generate_color, generate_color)
             self.add_label(shape)
+
+            if self.single_target_checkbox.isChecked():
+                for s in list(self.canvas.shapes):
+                    if s is not shape:
+                        self.remove_label(s)
+                self.canvas.update()
+
             if self.beginner():  # Switch to edit mode.
                 self.canvas.set_editing(True)
                 self.actions.create.setEnabled(True)
@@ -1204,6 +1304,12 @@ class MainWindow(QMainWindow, WindowMixin):
 
             if text not in self.label_hist:
                 self.label_hist.append(text)
+
+            if self.fast_annotate_checkbox.isChecked():
+                if self.dirty:
+                    self.save_file()
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(50, self._fast_annotate_advance)
         else:
             # User cancelled the label dialog, remove the last shape added in Canvas.finalise
             self.canvas.pop_shape()
@@ -1212,13 +1318,13 @@ class MainWindow(QMainWindow, WindowMixin):
     def scroll_request(self, delta, orientation):
         units = - delta / (8 * 15)
         bar = self.scroll_bars[orientation]
-        bar.setValue(bar.value() + bar.singleStep() * units)
+        bar.setValue(int(bar.value() + bar.singleStep() * units))
 
     def set_zoom(self, value):
         self.actions.fitWidth.setChecked(False)
         self.actions.fitWindow.setChecked(False)
         self.zoom_mode = self.MANUAL_ZOOM
-        self.zoom_widget.setValue(value)
+        self.zoom_widget.setValue(int(value))
 
     def add_zoom(self, increment=10):
         self.set_zoom(self.zoom_widget.value() + increment)
@@ -1272,8 +1378,8 @@ class MainWindow(QMainWindow, WindowMixin):
         new_h_bar_value = h_bar.value() + move_x * d_h_bar_max
         new_v_bar_value = v_bar.value() + move_y * d_v_bar_max
 
-        h_bar.setValue(new_h_bar_value)
-        v_bar.setValue(new_v_bar_value)
+        h_bar.setValue(int(new_h_bar_value))
+        v_bar.setValue(int(new_v_bar_value))
 
     def set_fit_window(self, value=True):
         if value:
@@ -1334,28 +1440,36 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.fill_color = QColor(*self.label_file.fillColor)
                 self.canvas.verified = self.label_file.verified
             else:
-                # Load image:
-                # read data first and store for saving into label file.
                 self.image_data = read(unicode_file_path, None)
                 self.label_file = None
                 self.canvas.verified = False
 
-            if isinstance(self.image_data, QImage):
-                image = self.image_data
+            if unicode_file_path in self._pixmap_cache:
+                pixmap = self._pixmap_cache[unicode_file_path]
+                image = pixmap.toImage()
             else:
-                image = QImage.fromData(self.image_data)
-            if image.isNull():
-                self.error_message(u'Error opening file',
-                                   u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
-                self.status("Error reading %s" % unicode_file_path)
-                return False
+                if isinstance(self.image_data, QImage):
+                    image = self.image_data
+                else:
+                    image = QImage.fromData(self.image_data)
+                if image.isNull():
+                    self.error_message(u'Error opening file',
+                                       u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
+                    self.status("Error reading %s" % unicode_file_path)
+                    return False
+                pixmap = QPixmap.fromImage(image)
+                self._pixmap_cache[unicode_file_path] = pixmap
+                if len(self._pixmap_cache) > 50:
+                    oldest = list(self._pixmap_cache.keys())[0]
+                    del self._pixmap_cache[oldest]
+
             self.status("Loaded %s" % os.path.basename(unicode_file_path))
             self.image = image
             self.file_path = unicode_file_path
-            self.canvas.load_pixmap(QPixmap.fromImage(image))
+            self.canvas.load_pixmap(pixmap)
             if self.label_file:
                 self.load_labels(self.label_file.shapes)
-            self.set_clean()
+
             self.canvas.setEnabled(True)
             self.adjust_scale(initial=True)
             self.paint_canvas()
@@ -1364,6 +1478,10 @@ class MainWindow(QMainWindow, WindowMixin):
             self.toggle_actions(True)
             self.show_bounding_box_from_annotation_file(file_path)
 
+            if self.single_target_checkbox.isChecked() and len(self.canvas.shapes) > 1:
+                self._prompt_single_target_selection()
+
+            self.set_clean()
             counter = self.counter_str()
             self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
 
@@ -1373,8 +1491,73 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.label_list.item(self.label_list.count() - 1).setSelected(True)
 
             self.canvas.setFocus(True)
+            self._preload_adjacent()
             return True
         return False
+
+    def _preload_adjacent(self):
+        from threading import Thread
+        try:
+            idx = self.m_img_list.index(self.file_path)
+        except ValueError:
+            return
+        cache = self._pixmap_cache
+        paths = []
+        for pi in [idx + 1, idx + 2, idx - 1]:
+            if 0 <= pi < len(self.m_img_list):
+                p = self.m_img_list[pi]
+                if p not in cache:
+                    paths.append(p)
+        if not paths:
+            return
+        def _load():
+            for path in paths:
+                if path in cache:
+                    continue
+                try:
+                    pm = QPixmap(path)
+                    if not pm.isNull():
+                        cache[path] = pm
+                        if len(cache) > 50:
+                            oldest = list(cache.keys())[0]
+                            del cache[oldest]
+                except Exception:
+                    pass
+        t = Thread(target=_load, daemon=True)
+        t.start()
+
+    def _prompt_single_target_selection(self):
+        shapes = list(self.canvas.shapes)
+        if len(shapes) <= 1:
+            return
+        labels = [s.label for s in shapes]
+        label, ok = QInputDialog.getItem(
+            self, '单目标模式', '检测到多个标注框，请选择要保留的目标：',
+            labels, 0, False)
+        if not ok:
+            return
+        keep_shape = None
+        for s in shapes:
+            if s.label == label and keep_shape is None:
+                keep_shape = s
+        if keep_shape is None:
+            return
+        to_remove = [s for s in shapes if s is not keep_shape]
+        self.canvas.shapes = [keep_shape]
+        for s in to_remove:
+            if s in self.shapes_to_items:
+                item = self.shapes_to_items[s]
+                self.label_list.takeItem(self.label_list.row(item))
+                del self.shapes_to_items[s]
+                if item in self.items_to_shapes:
+                    del self.items_to_shapes[item]
+        self.update_combo_box()
+        self.canvas.update()
+        self.save_file()
+
+    def _fast_annotate_advance(self):
+        if self.fast_annotate_checkbox.isChecked():
+            self.open_next_image()
 
     def counter_str(self):
         """
@@ -1513,8 +1696,12 @@ class MainWindow(QMainWindow, WindowMixin):
         settings[SETTING_AUTO_SAVE_ALL] = self.auto_save_all.isChecked()
         settings[SETTING_SINGLE_CLASS] = self.single_class_mode.isChecked()
         settings[SETTING_PAINT_LABEL] = self.display_label_option.isChecked()
+        settings[SETTING_SINGLE_TARGET] = self.single_target_checkbox.isChecked()
+        settings[SETTING_FAST_ANNOTATE] = self.fast_annotate_checkbox.isChecked()
         settings[SETTING_DRAW_SQUARE] = self.draw_squares_option.isChecked()
         settings[SETTING_LABEL_FILE_FORMAT] = self.label_file_format
+        settings[SETTING_SINGLE_TARGET] = self.single_target_checkbox.isChecked()
+        settings[SETTING_FAST_ANNOTATE] = self.fast_annotate_checkbox.isChecked()
         settings.save()
 
     def load_recent(self, filename):
@@ -1622,13 +1809,12 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def open_prev_image(self, _value=False):
         self.discard_drawing()
-        # Proceeding prev image without dialog if having any label
-        if self.auto_saving.isChecked():
+        if self.auto_saving.isChecked() or self.auto_save_all.isChecked():
             if self.dirty is True:
                 self.save_file()
-
-        if not self.may_continue():
-            return
+        else:
+            if not self.may_continue():
+                return
 
         if self.img_count <= 0:
             return
@@ -1644,13 +1830,12 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def open_next_image(self, _value=False):
         self.discard_drawing()
-        # Proceeding prev image without dialog if having any label
-        if self.auto_saving.isChecked():
+        if self.auto_saving.isChecked() or self.auto_save_all.isChecked():
             if self.dirty is True:
                 self.save_file()
-
-        if not self.may_continue():
-            return
+        else:
+            if not self.may_continue():
+                return
 
         if self.img_count <= 0:
             return
@@ -2053,6 +2238,33 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.status('已覆盖并复制选中标签到后续 {} 帧，成功 {} 张'.format(count, appended))
         self.statusBar().show()
+
+    def smart_copy_similar(self):
+        selected_items = self.label_list.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, '提示', '请先在右侧标签列表中选择要复制的标签。')
+            return
+        if not self.file_path:
+            return
+
+        from libs.similarity import find_similar_range
+        try:
+            current_index = self.m_img_list.index(self.file_path)
+        except ValueError:
+            return
+
+        similar_count, _ = find_similar_range(self.m_img_list, current_index)
+        if similar_count <= 0:
+            QMessageBox.information(self, '智能复制', '未检测到相似后续帧。')
+            return
+
+        ret = QMessageBox.question(
+            self, '智能复制相似帧',
+            f'检测到后续 {similar_count} 帧与当前帧高度相似。\n'
+            f'是否将选中的 {len(selected_items)} 个标签复制到这些帧？',
+            QMessageBox.Yes | QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            self.copy_selected_labels_to_next_frames(similar_count)
 
     def toggle_paint_labels_option(self):
         for shape in self.canvas.shapes:
