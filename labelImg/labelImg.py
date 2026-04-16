@@ -148,6 +148,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.file_path = ustr(default_filename)
         self.last_open_dir = None
         self._pixmap_cache = {}
+        self._image_cache = {}
         self._sam_predictor = None
         self._sam_mode = False
         self.recent_files = []
@@ -161,6 +162,7 @@ class MainWindow(QMainWindow, WindowMixin):
         # Undo stack for annotation operations (stores up to 3 snapshots)
         self.undo_stack = []
         self.max_undo = 10
+        self._suspend_auto_save = False
 
         list_layout = QVBoxLayout()
         list_layout.setContentsMargins(0, 0, 0, 0)
@@ -797,6 +799,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.actions.save.setEnabled(True)
         # Auto save operations if enabled
         try:
+            if getattr(self, '_suspend_auto_save', False):
+                return
             # Original auto_saving or custom auto_save_all
             if (hasattr(self, 'auto_save_all') and self.auto_save_all.isChecked()) or \
                (hasattr(self, 'auto_saving') and self.auto_saving.isChecked()):
@@ -1120,13 +1124,22 @@ class MainWindow(QMainWindow, WindowMixin):
         item = HashableQListWidgetItem(shape.label)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Checked)
-        item.setBackground(generate_color_by_text(shape.label))
+        self._set_label_item_style(item, shape.label)
         self.items_to_shapes[item] = shape
         self.shapes_to_items[shape] = item
         self.label_list.addItem(item)
         for action in self.actions.onShapesPresent:
             action.setEnabled(True)
         self.update_combo_box()
+
+    def _set_label_item_style(self, item, label_text):
+        color = generate_color_by_text(label_text)
+        # 标签列表颜色使用不透明背景，避免主题透明叠加后看起来“同色”
+        solid = QColor(color.red(), color.green(), color.blue(), 255)
+        item.setBackground(QBrush(solid))
+        # 根据亮度自动设置前景色，保证可读性
+        luminance = (0.299 * solid.red() + 0.587 * solid.green() + 0.114 * solid.blue())
+        item.setForeground(QBrush(QColor(20, 20, 20) if luminance > 160 else QColor(245, 245, 245)))
 
     def remove_label(self, shape):
         if shape is None:
@@ -1145,6 +1158,8 @@ class MainWindow(QMainWindow, WindowMixin):
     def load_labels(self, shapes):
         s = []
         for label, points, line_color, fill_color, difficult in shapes:
+            if label and label not in self.label_hist:
+                self.label_hist.append(label)
             shape = Shape(label=label)
             for x, y in points:
 
@@ -1256,7 +1271,11 @@ class MainWindow(QMainWindow, WindowMixin):
         if label != shape.label:
             shape.label = item.text()
             shape.line_color = generate_color_by_text(shape.label)
+            self._set_label_item_style(item, shape.label)
+            if shape.label and shape.label not in self.label_hist:
+                self.label_hist.append(shape.label)
             self.set_dirty()
+            self.update_combo_box()
         else:  # User probably changed item visibility
             self.canvas.set_shape_visible(shape, item.checkState() == Qt.Checked)
 
@@ -1399,101 +1418,112 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def load_file(self, file_path=None):
         """Load the specified file, or the last opened file if None."""
+        self._suspend_auto_save = True
         self.reset_state()
         self.canvas.setEnabled(False)
-        if file_path is None:
-            file_path = self.settings.get(SETTING_FILENAME)
+        try:
+            if file_path is None:
+                file_path = self.settings.get(SETTING_FILENAME)
 
-        # 每日图片统计逻辑
-        self.update_daily_stats(file_path)
+            # 每日图片统计逻辑
+            self.update_daily_stats(file_path)
 
-        # Make sure that filePath is a regular python string, rather than QString
-        file_path = ustr(file_path)
+            # Make sure that filePath is a regular python string, rather than QString
+            file_path = ustr(file_path)
 
-        # Fix bug: An  index error after select a directory when open a new file.
-        unicode_file_path = ustr(file_path)
-        unicode_file_path = os.path.abspath(unicode_file_path)
-        # Tzutalin 20160906 : Add file list and dock to move faster
-        # Highlight the file item
-        if unicode_file_path and self.file_list_widget.count() > 0:
-            if unicode_file_path in self.m_img_list:
-                index = self.m_img_list.index(unicode_file_path)
-                file_widget_item = self.file_list_widget.item(index)
-                file_widget_item.setSelected(True)
-            else:
-                self.file_list_widget.clear()
-                self.m_img_list.clear()
-
-        if unicode_file_path and os.path.exists(unicode_file_path):
-            if LabelFile.is_label_file(unicode_file_path):
-                try:
-                    self.label_file = LabelFile(unicode_file_path)
-                except LabelFileError as e:
-                    self.error_message(u'Error opening file',
-                                       (u"<p><b>%s</b></p>"
-                                        u"<p>Make sure <i>%s</i> is a valid label file.")
-                                       % (e, unicode_file_path))
-                    self.status("Error reading %s" % unicode_file_path)
-                    return False
-                self.image_data = self.label_file.image_data
-                self.line_color = QColor(*self.label_file.lineColor)
-                self.fill_color = QColor(*self.label_file.fillColor)
-                self.canvas.verified = self.label_file.verified
-            else:
-                self.image_data = read(unicode_file_path, None)
-                self.label_file = None
-                self.canvas.verified = False
-
-            if unicode_file_path in self._pixmap_cache:
-                pixmap = self._pixmap_cache[unicode_file_path]
-                image = pixmap.toImage()
-            else:
-                if isinstance(self.image_data, QImage):
-                    image = self.image_data
+            # Fix bug: An  index error after select a directory when open a new file.
+            unicode_file_path = ustr(file_path)
+            unicode_file_path = os.path.abspath(unicode_file_path)
+            # Tzutalin 20160906 : Add file list and dock to move faster
+            # Highlight the file item
+            if unicode_file_path and self.file_list_widget.count() > 0:
+                if unicode_file_path in self.m_img_list:
+                    index = self.m_img_list.index(unicode_file_path)
+                    file_widget_item = self.file_list_widget.item(index)
+                    file_widget_item.setSelected(True)
                 else:
-                    image = QImage.fromData(self.image_data)
-                if image.isNull():
-                    self.error_message(u'Error opening file',
-                                       u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
-                    self.status("Error reading %s" % unicode_file_path)
-                    return False
-                pixmap = QPixmap.fromImage(image)
-                self._pixmap_cache[unicode_file_path] = pixmap
-                if len(self._pixmap_cache) > 50:
-                    oldest = list(self._pixmap_cache.keys())[0]
-                    del self._pixmap_cache[oldest]
+                    self.file_list_widget.clear()
+                    self.m_img_list.clear()
 
-            self.status("Loaded %s" % os.path.basename(unicode_file_path))
-            self.image = image
-            self.file_path = unicode_file_path
-            self.canvas.load_pixmap(pixmap)
-            if self.label_file:
-                self.load_labels(self.label_file.shapes)
+            if unicode_file_path and os.path.exists(unicode_file_path):
+                if LabelFile.is_label_file(unicode_file_path):
+                    try:
+                        self.label_file = LabelFile(unicode_file_path)
+                    except LabelFileError as e:
+                        self.error_message(u'Error opening file',
+                                           (u"<p><b>%s</b></p>"
+                                            u"<p>Make sure <i>%s</i> is a valid label file.")
+                                           % (e, unicode_file_path))
+                        self.status("Error reading %s" % unicode_file_path)
+                        return False
+                    self.image_data = self.label_file.image_data
+                    self.line_color = QColor(*self.label_file.lineColor)
+                    self.fill_color = QColor(*self.label_file.fillColor)
+                    self.canvas.verified = self.label_file.verified
+                else:
+                    self.image_data = read(unicode_file_path, None)
+                    self.label_file = None
+                    self.canvas.verified = False
 
-            self.canvas.setEnabled(True)
-            self.adjust_scale(initial=True)
-            self.paint_canvas()
-            self.add_recent_file(self.file_path)
-            self.update_dir_labels()
-            self.toggle_actions(True)
-            self.show_bounding_box_from_annotation_file(file_path)
+                if unicode_file_path in self._image_cache:
+                    image = self._image_cache[unicode_file_path]
+                    pixmap = self._pixmap_cache.get(unicode_file_path)
+                    if pixmap is None:
+                        pixmap = QPixmap.fromImage(image)
+                        self._pixmap_cache[unicode_file_path] = pixmap
+                else:
+                    if isinstance(self.image_data, QImage):
+                        image = self.image_data
+                    else:
+                        image = QImage.fromData(self.image_data)
+                    if image.isNull():
+                        self.error_message(u'Error opening file',
+                                           u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
+                        self.status("Error reading %s" % unicode_file_path)
+                        return False
+                    pixmap = QPixmap.fromImage(image)
+                    self._image_cache[unicode_file_path] = image
+                    self._pixmap_cache[unicode_file_path] = pixmap
+                    if len(self._pixmap_cache) > 50:
+                        oldest = list(self._pixmap_cache.keys())[0]
+                        del self._pixmap_cache[oldest]
+                    if len(self._image_cache) > 50:
+                        oldest = list(self._image_cache.keys())[0]
+                        del self._image_cache[oldest]
 
-            if self.single_target_checkbox.isChecked() and len(self.canvas.shapes) > 1:
-                self._prompt_single_target_selection()
+                self.status("Loaded %s" % os.path.basename(unicode_file_path))
+                self.image = image
+                self.file_path = unicode_file_path
+                self.canvas.load_pixmap(pixmap)
+                if self.label_file:
+                    self.load_labels(self.label_file.shapes)
 
-            self.set_clean()
-            counter = self.counter_str()
-            self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
+                self.canvas.setEnabled(True)
+                self.adjust_scale(initial=True)
+                self.paint_canvas()
+                self.add_recent_file(self.file_path)
+                self.update_dir_labels()
+                self.toggle_actions(True)
+                self.show_bounding_box_from_annotation_file(file_path)
 
-            # Default : select last item if there is at least one item
-            if self.label_list.count():
-                self.label_list.setCurrentItem(self.label_list.item(self.label_list.count() - 1))
-                self.label_list.item(self.label_list.count() - 1).setSelected(True)
+                if self.single_target_checkbox.isChecked() and len(self.canvas.shapes) > 1:
+                    self._prompt_single_target_selection()
 
-            self.canvas.setFocus(True)
-            self._preload_adjacent()
-            return True
-        return False
+                self.set_clean()
+                counter = self.counter_str()
+                self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
+
+                # Default : select last item if there is at least one item
+                if self.label_list.count():
+                    self.label_list.setCurrentItem(self.label_list.item(self.label_list.count() - 1))
+                    self.label_list.item(self.label_list.count() - 1).setSelected(True)
+
+                self.canvas.setFocus(True)
+                self._preload_adjacent()
+                return True
+            return False
+        finally:
+            self._suspend_auto_save = False
 
     def _preload_adjacent(self):
         from threading import Thread
@@ -1501,26 +1531,26 @@ class MainWindow(QMainWindow, WindowMixin):
             idx = self.m_img_list.index(self.file_path)
         except ValueError:
             return
-        cache = self._pixmap_cache
+        image_cache = self._image_cache
         paths = []
         for pi in [idx + 1, idx + 2, idx - 1]:
             if 0 <= pi < len(self.m_img_list):
                 p = self.m_img_list[pi]
-                if p not in cache:
+                if p not in image_cache:
                     paths.append(p)
         if not paths:
             return
         def _load():
             for path in paths:
-                if path in cache:
+                if path in image_cache:
                     continue
                 try:
-                    pm = QPixmap(path)
-                    if not pm.isNull():
-                        cache[path] = pm
-                        if len(cache) > 50:
-                            oldest = list(cache.keys())[0]
-                            del cache[oldest]
+                    img = read(path, None)
+                    if img is not None and not img.isNull():
+                        image_cache[path] = img
+                        if len(image_cache) > 50:
+                            oldest = list(image_cache.keys())[0]
+                            del image_cache[oldest]
                 except Exception:
                     pass
         t = Thread(target=_load, daemon=True)
@@ -2167,6 +2197,47 @@ class MainWindow(QMainWindow, WindowMixin):
             QMessageBox.warning(self, '警告', '当前文件不在图片列表中，无法定位后续帧。')
             return
 
+        def shape_key(shape_dict):
+            pts = tuple((round(p[0], 2), round(p[1], 2)) for p in shape_dict['points'])
+            return shape_dict['label'], pts
+
+        def load_existing_shapes(img_path, use_format, xml_path, txt_path, json_path):
+            existing = []
+            try:
+                if use_format == LabelFileFormat.PASCAL_VOC and os.path.isfile(xml_path):
+                    reader = PascalVocReader(xml_path)
+                    for label, points, line_color, fill_color, difficult in reader.get_shapes():
+                        existing.append(dict(
+                            label=label,
+                            line_color=line_color,
+                            fill_color=fill_color,
+                            points=points,
+                            difficult=difficult,
+                        ))
+                elif use_format == LabelFileFormat.YOLO and os.path.isfile(txt_path):
+                    reader = YoloReader(txt_path, self.image)
+                    for label, points, line_color, fill_color, difficult in reader.get_shapes():
+                        existing.append(dict(
+                            label=label,
+                            line_color=line_color,
+                            fill_color=fill_color,
+                            points=points,
+                            difficult=difficult,
+                        ))
+                elif use_format == LabelFileFormat.CREATE_ML and os.path.isfile(json_path):
+                    reader = CreateMLReader(json_path, img_path)
+                    for label, points, line_color, fill_color, difficult in reader.get_shapes():
+                        existing.append(dict(
+                            label=label,
+                            line_color=line_color,
+                            fill_color=fill_color,
+                            points=points,
+                            difficult=difficult,
+                        ))
+            except Exception as e:
+                print('读取已有标注失败: {} ({})'.format(img_path, e))
+            return existing
+
         total = len(self.m_img_list)
         appended = 0
         for step in range(1, count + 1):
@@ -2198,8 +2269,15 @@ class MainWindow(QMainWindow, WindowMixin):
             else:
                 use_format = self.label_file_format
 
-            # 仅包含选中的形状（不保留目标帧原有的标注）
-            shapes_to_write = [format_shape(s) for s in selected_shapes]
+            existing_shapes = load_existing_shapes(target_img_path, use_format, xml_path, txt_path, json_path)
+            shapes_to_write = list(existing_shapes)
+            existing_keys = {shape_key(s) for s in existing_shapes}
+            for s in selected_shapes:
+                formatted = format_shape(s)
+                key = shape_key(formatted)
+                if key not in existing_keys:
+                    shapes_to_write.append(formatted)
+                    existing_keys.add(key)
 
             # 写入目标文件
             lf = LabelFile()
@@ -2236,7 +2314,7 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.status('保存到第 {} 帧失败: 权限不足或文件被占用'.format(idx + 1))
                 continue
 
-        self.status('已覆盖并复制选中标签到后续 {} 帧，成功 {} 张'.format(count, appended))
+        self.status('已保留原标注并复制选中标签到后续 {} 帧，成功 {} 张'.format(count, appended))
         self.statusBar().show()
 
     def smart_copy_similar(self):

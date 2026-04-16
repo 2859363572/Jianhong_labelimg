@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\Python_environment\\Project\\labelImg\\img\\1.ico'],
+    icon=['img\\1.ico'],
 )
