@@ -19,7 +19,7 @@
 
 ### 方式一：直接运行
 
-使用打包产物：`dist/labelImg.exe`
+使用打包产物：`release/labelImg.exe`
 
 ### 方式二：源码运行
 
@@ -92,15 +92,19 @@ python run.py
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name labelImg --icon "img/1.ico" --hidden-import onnxruntime run.py
+pyinstaller --onefile --noconsole --name labelImg --icon "img/labelimg.ico" --hidden-import onnxruntime run.py
 ```
 
-输出文件：`dist/labelImg.exe`
+输出文件：`release/labelImg.exe`
 
 ## 目录结构
 
 ```
 Jianhong_labelimg/
+├── docs/
+│   ├── project-layout.md
+│   ├── release-workflow.md
+│   └── README.md
 ├── labelImg/
 │   └── labelImg.py
 ├── libs/
@@ -112,9 +116,17 @@ Jianhong_labelimg/
 │   ├── sam_predictor.py
 │   └── sam_dialog.py
 ├── img/
+├── release/
 ├── run.py
 └── README.md
 ```
+
+## 结构约定
+
+- 源码只放 `labelImg/` 和 `libs/`
+- 打包产物只放 `release/`
+- 构建临时目录只允许短期存在 `build-*` / `dist-*`
+- 说明文档统一放 `docs/`
 
 ## 许可证
 

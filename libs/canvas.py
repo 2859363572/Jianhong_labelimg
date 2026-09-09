@@ -22,12 +22,13 @@ CURSOR_GRAB = Qt.OpenHandCursor
 
 
 class Canvas(QWidget):
-    zoomRequest = pyqtSignal(int)
+    zoomRequest = pyqtSignal(int, QPoint)
     scrollRequest = pyqtSignal(int, int)
     newShape = pyqtSignal()
     selectionChanged = pyqtSignal(bool)
     shapeMoved = pyqtSignal()
     drawingPolygon = pyqtSignal(bool)
+    imageRouteDragRequested = pyqtSignal()
 
     CREATE, EDIT = list(range(2))
 
@@ -63,6 +64,7 @@ class Canvas(QWidget):
         self.setFocusPolicy(Qt.WheelFocus)
         self.verified = False
         self.draw_square = False
+        self._interaction_blocked = False
 
         # initialisation for panning
         self.pan_initial_pos = QPoint()
@@ -113,6 +115,9 @@ class Canvas(QWidget):
     def set_drawing_color(self, qcolor):
         self.drawing_line_color = qcolor
         self.drawing_rect_color = qcolor
+
+    def set_interaction_blocked(self, blocked):
+        self._interaction_blocked = blocked
 
     def enterEvent(self, ev):
         self.override_cursor(self._cursor)
@@ -303,6 +308,8 @@ class Canvas(QWidget):
             self.override_cursor(CURSOR_DEFAULT)
 
     def mousePressEvent(self, ev):
+        if self._interaction_blocked:
+            return
         pos = self.transform_pos(ev.pos())
 
         if ev.button() == Qt.LeftButton:
@@ -331,6 +338,8 @@ class Canvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, ev):
+        if self._interaction_blocked:
+            return
         if ev.button() == Qt.RightButton:
             menu = self.menus[bool(self.selected_shape_copy)]
             self.restore_cursor()
@@ -404,6 +413,11 @@ class Canvas(QWidget):
     def mouseDoubleClickEvent(self, ev):
         # We need at least 4 points here, since the mousePress handler
         # adds an extra one before this handler is called.
+        if ev.button() == Qt.RightButton:
+            window = self.parent().window()
+            if hasattr(window, 'start_image_route_drag'):
+                window.start_image_route_drag()
+                return
         if self.can_close_shape() and len(self.current) > 3:
             self.current.pop_point()
             self.finalise()
@@ -728,12 +742,14 @@ class Canvas(QWidget):
     # These two, along with a call to adjustSize are required for the
     # scroll area.
     def sizeHint(self):
-        return self.minimumSizeHint()
-
-    def minimumSizeHint(self):
         if self.pixmap:
             return self.scale * self.pixmap.size()
-        return super(Canvas, self).minimumSizeHint()
+        return super(Canvas, self).sizeHint()
+
+    def minimumSizeHint(self):
+        # The image may be much larger than the display. Keep scrolling in the
+        # QScrollArea instead of letting this hint enlarge the main window.
+        return QSize(1, 1)
 
     def wheelEvent(self, ev):
         qt_version = 4 if hasattr(ev, "delta") else 5
@@ -750,8 +766,10 @@ class Canvas(QWidget):
             v_delta = delta.y()
 
         mods = ev.modifiers()
-        if Qt.ControlModifier == int(mods) and v_delta:
-            self.zoomRequest.emit(v_delta)
+        if mods & Qt.ControlModifier and v_delta:
+            # Pass the local cursor position so the scroll area can preserve
+            # the image point beneath it while changing scale.
+            self.zoomRequest.emit(v_delta, ev.pos())
         else:
             v_delta and self.scrollRequest.emit(v_delta, Qt.Vertical)
             h_delta and self.scrollRequest.emit(h_delta, Qt.Horizontal)
@@ -879,5 +897,3 @@ class Canvas(QWidget):
 
     def set_drawing_shape_to_square(self, status):
         self.draw_square = status
-
-

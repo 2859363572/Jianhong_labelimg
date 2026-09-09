@@ -9,6 +9,7 @@ import re
 import sys
 import subprocess
 import shutil
+import tempfile
 import webbrowser as wb
 
 from functools import partial
@@ -52,7 +53,7 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
-from libs.theme import apply_theme
+from libs.theme import apply_theme, THEMES, CURRENT_THEME
 
 __appname__ = 'labelImg'
 
@@ -68,11 +69,13 @@ class WindowMixin(object):
     def toolbar(self, title, actions=None):
         toolbar = ToolBar(title)
         toolbar.setObjectName(u'%sToolBar' % title)
-        # toolbar.setOrientation(Qt.Vertical)
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        toolbar.setOrientation(Qt.Horizontal)
+        toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        toolbar.setMovable(False)
+        toolbar.setAllowedAreas(Qt.TopToolBarArea)
         if actions:
             add_actions(toolbar, actions)
-        self.addToolBar(Qt.LeftToolBarArea, toolbar)
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
         return toolbar
 
 
@@ -92,12 +95,44 @@ class ImagePreloader(QThread):
                 pixmap = QPixmap(self.image_paths[i])
                 self.imageLoaded.emit(self.image_paths[i], pixmap)
 
+
+class RouteTargetButton(QPushButton):
+    imageDropped = pyqtSignal(int)
+
+    def __init__(self, route_index, parent=None):
+        super(RouteTargetButton, self).__init__(parent)
+        self.route_index = route_index
+        self.setObjectName('RouteTargetButton')
+        self.setAcceptDrops(True)
+        self.setProperty('dragActive', False)
+
+    def _set_drag_active(self, active):
+        self.setProperty('dragActive', active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat('application/x-labelimg-current-image'):
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        self._set_drag_active(False)
+        if event.mimeData().hasFormat('application/x-labelimg-current-image'):
+            self.imageDropped.emit(self.route_index)
+            event.acceptProposedAction()
+
 class MainWindow(QMainWindow, WindowMixin):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = list(range(3))
 
     def __init__(self, default_filename=None, default_prefdef_class_file=None, default_save_dir=None):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
+        self.setWindowIcon(new_icon('labelimg'))
 
         # Load setting in the main thread
         self.settings = Settings()
@@ -116,11 +151,15 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # For loading all image under a directory
         self.m_img_list = []
+        self._img_path_to_idx = {}
+        self._annotated_paths = set()
+        self._annotated_count_cache = 0
+        self._annotated_dirty = True
         self.dir_name = None
         self.label_hist = []
         self.last_open_dir = None
         self.cur_img_idx = 0
-        self.img_count = 1
+        self.img_count = 0
         
         # UI state for directory display
         self.image_dir_label = None
@@ -162,10 +201,58 @@ class MainWindow(QMainWindow, WindowMixin):
         # Undo stack for annotation operations (stores up to 3 snapshots)
         self.undo_stack = []
         self.max_undo = 10
+        self.undo_action_stack = []
+        self.deleted_image_stack = []
+        self.max_deleted_image_undo = 5
+        self.skip_delete_confirm = False
         self._suspend_auto_save = False
+        self._loading_file = False
+        self.daily_stats = settings.get(SETTING_DAILY_STATS, {})
+        self._daily_stats_save_pending = False
 
+        inspector_layout = QVBoxLayout()
+        inspector_layout.setContentsMargins(14, 12, 14, 14)
+        inspector_layout.setSpacing(10)
+
+        inspector_tabs = QHBoxLayout()
+        inspector_tabs.setSpacing(4)
+        self.annotations_tab_button = QToolButton()
+        self.annotations_tab_button.setText('Annotations')
+        self.annotations_tab_button.setObjectName('InspectorTab')
+        self.annotations_tab_button.setCheckable(True)
+        self.routing_tab_button = QToolButton()
+        self.routing_tab_button.setText('Image Routing')
+        self.routing_tab_button.setObjectName('InspectorTab')
+        self.routing_tab_button.setCheckable(True)
+        inspector_tab_group = QButtonGroup(self)
+        inspector_tab_group.setExclusive(True)
+        inspector_tab_group.addButton(self.annotations_tab_button, 0)
+        inspector_tab_group.addButton(self.routing_tab_button, 1)
+        self.annotations_tab_button.setChecked(True)
+        inspector_tabs.addWidget(self.annotations_tab_button)
+        inspector_tabs.addWidget(self.routing_tab_button)
+        inspector_layout.addLayout(inspector_tabs)
+
+        self.inspector_stack = QStackedWidget()
+        self.inspector_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.inspector_stack.setMinimumWidth(0)
+        inspector_layout.addWidget(self.inspector_stack)
+
+        annotations_page = QWidget()
         list_layout = QVBoxLayout()
-        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setContentsMargins(0, 2, 0, 0)
+        list_layout.setSpacing(10)
+        annotations_page.setLayout(list_layout)
+
+        inspector_title = QLabel('Annotations')
+        inspector_title.setObjectName('SectionTitle')
+        self.object_count_label = QLabel('Objects  0')
+        self.object_count_label.setObjectName('MutedLabel')
+        inspector_header = QHBoxLayout()
+        inspector_header.addWidget(inspector_title)
+        inspector_header.addStretch()
+        inspector_header.addWidget(self.object_count_label)
+        list_layout.addLayout(inspector_header)
 
         # Create a widget for using default label
         self.use_default_label_checkbox = QCheckBox(get_str('useDefaultLabel'))
@@ -187,10 +274,11 @@ class MainWindow(QMainWindow, WindowMixin):
         self.edit_button = QToolButton()
         self.edit_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
-        # Add some of widgets to list_layout
-        list_layout.addWidget(self.edit_button)
-        list_layout.addWidget(self.single_target_checkbox)
-        list_layout.addWidget(self.fast_annotate_checkbox)
+        mode_layout = QHBoxLayout()
+        mode_layout.setSpacing(12)
+        mode_layout.addWidget(self.single_target_checkbox)
+        mode_layout.addWidget(self.fast_annotate_checkbox)
+        list_layout.addLayout(mode_layout)
         list_layout.addWidget(use_default_label_container)
 
         # Create and add combobox for showing unique labels in group
@@ -199,10 +287,10 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Create and add a widget for showing current label items
         self.label_list = QListWidget()
+        self.label_list.setObjectName("LabelList")
+        self.label_list.setIconSize(QSize(18, 18))
         # 允许标签列表多选，支持批量复制
         self.label_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        label_list_container = QWidget()
-        label_list_container.setLayout(list_layout)
         self.label_list.itemActivated.connect(self.label_selection_changed)
         self.label_list.itemSelectionChanged.connect(self.label_selection_changed)
         self.label_list.itemDoubleClicked.connect(self.edit_label)
@@ -210,22 +298,105 @@ class MainWindow(QMainWindow, WindowMixin):
         self.label_list.itemChanged.connect(self.label_item_changed)
         list_layout.addWidget(self.label_list)
 
+        inspector_separator = QFrame()
+        inspector_separator.setFrameShape(QFrame.HLine)
+        inspector_separator.setObjectName('InspectorSeparator')
+        list_layout.addWidget(inspector_separator)
+        selected_title = QLabel('SELECTED OBJECT')
+        selected_title.setObjectName('MutedLabel')
+        list_layout.addWidget(selected_title)
+        self.selected_object_label = QLabel('No object selected')
+        self.selected_object_label.setObjectName('CanvasMeta')
+        self.selected_object_label.setWordWrap(True)
+        list_layout.addWidget(self.selected_object_label)
+        list_layout.addWidget(self.edit_button)
+
+        routing_page = QWidget()
+        routing_layout = QVBoxLayout()
+        routing_layout.setContentsMargins(0, 2, 0, 0)
+        routing_layout.setSpacing(10)
+        route_title_layout = QHBoxLayout()
+        route_title = QLabel('Image Routing')
+        route_title.setObjectName('SectionTitle')
+        add_route_button = QPushButton('Add')
+        add_route_button.clicked.connect(self.add_image_route)
+        route_title_layout.addWidget(route_title)
+        route_title_layout.addStretch()
+        route_title_layout.addWidget(add_route_button)
+        routing_layout.addLayout(route_title_layout)
+
+        route_hint = QLabel('Right-double-click the image and keep moving to a target, or use Ctrl+Alt+1…9')
+        route_hint.setObjectName('MutedLabel')
+        route_hint.setWordWrap(True)
+        routing_layout.addWidget(route_hint)
+        self.route_targets_container = QWidget()
+        self.route_targets_container.setObjectName('DockPanel')
+        self.route_targets_layout = QVBoxLayout()
+        self.route_targets_layout.setContentsMargins(0, 0, 0, 0)
+        self.route_targets_layout.setSpacing(6)
+        self.route_targets_container.setLayout(self.route_targets_layout)
+        routing_layout.addWidget(self.route_targets_container)
+        routing_layout.addStretch()
+        routing_page.setLayout(routing_layout)
+
+        self.image_routes = self._normalise_image_routes(
+            settings.get(SETTING_IMAGE_ROUTES, []))
+        self.route_shortcuts = []
+
+        self.inspector_stack.addWidget(annotations_page)
+        self.inspector_stack.addWidget(routing_page)
+        inspector_tab_group.idClicked.connect(self.inspector_stack.setCurrentIndex)
+
+        label_list_container = QWidget()
+        label_list_container.setObjectName('DockPanel')
+        label_list_container.setLayout(inspector_layout)
+        label_list_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        label_list_container.setMinimumWidth(0)
 
 
-        self.dock = QDockWidget(get_str('boxLabelText'), self)
-        self.dock.setObjectName(get_str('labels'))
+
+        self.dock = QDockWidget('Annotations', self)
+        self.dock.setObjectName('AnnotationsDock')
         self.dock.setWidget(label_list_container)
+        self.dock.setTitleBarWidget(QWidget())
+        self.dock.setMinimumWidth(180)
+        self.dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.file_list_widget = QListWidget()
+        self.file_list_widget.setObjectName("FileList")
         self.file_list_widget.itemDoubleClicked.connect(self.file_item_double_clicked)
+        self.file_list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list_widget.customContextMenuRequested.connect(self.file_list_context_menu)
         file_list_layout = QVBoxLayout()
-        file_list_layout.setContentsMargins(0, 0, 0, 0)
+        file_list_layout.setContentsMargins(12, 12, 12, 12)
+        file_list_layout.setSpacing(10)
+        frames_title = QLabel('Frames')
+        frames_title.setObjectName('SectionTitle')
+        self.frame_search = QLineEdit()
+        self.frame_search.setPlaceholderText('Search frames')
+        self.frame_search.setClearButtonEnabled(True)
+        self.frame_search.textChanged.connect(self.filter_frame_list)
+        self.frame_summary_label = QLabel('0 frames  •  0 labeled')
+        self.frame_summary_label.setObjectName('MutedLabel')
+        self.labeling_progress = QProgressBar()
+        self.labeling_progress.setTextVisible(False)
+        self.labeling_progress.setFixedHeight(4)
+        file_list_layout.addWidget(frames_title)
+        file_list_layout.addWidget(self.frame_search)
+        file_list_layout.addWidget(self.frame_summary_label)
+        file_list_layout.addWidget(self.labeling_progress)
         file_list_layout.addWidget(self.file_list_widget)
         file_list_container = QWidget()
+        file_list_container.setObjectName('DockPanel')
         file_list_container.setLayout(file_list_layout)
-        self.file_dock = QDockWidget(get_str('fileList'), self)
-        self.file_dock.setObjectName(get_str('files'))
+        file_list_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        file_list_container.setMinimumWidth(0)
+        self.file_dock = QDockWidget('Frames', self)
+        self.file_dock.setObjectName('FramesDock')
         self.file_dock.setWidget(file_list_container)
+        self.file_dock.setTitleBarWidget(QWidget())
+        self.file_dock.setMinimumWidth(160)
+        self.file_dock.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.zoom_widget = ZoomWidget()
         self.color_dialog = ColorDialog(parent=self)
@@ -236,7 +407,15 @@ class MainWindow(QMainWindow, WindowMixin):
 
         scroll = QScrollArea()
         scroll.setWidget(self.canvas)
-        scroll.setWidgetResizable(True)
+        # Keep the canvas at its scaled image size for cursor-anchored zooming.
+        scroll.setWidgetResizable(False)
+        viewport = scroll.viewport()
+        viewport.setAutoFillBackground(True)
+        viewport_palette = viewport.palette()
+        viewport_palette.setColor(viewport.backgroundRole(), QColor(232, 232, 232))
+        viewport.setPalette(viewport_palette)
+        viewport.setStyleSheet('background-color: rgb(232, 232, 232);')
+        viewport.installEventFilter(self)
         self.scroll_bars = {
             Qt.Vertical: scroll.verticalScrollBar(),
             Qt.Horizontal: scroll.horizontalScrollBar()
@@ -245,34 +424,113 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.scrollRequest.connect(self.scroll_request)
 
         # Directory display
-        self.image_dir_label = QLabel('图片目录: 未设置')
+        self.image_dir_label = QLabel('No image directory')
         self.image_dir_label.setObjectName("ImageDirLabel")
-        self.image_dir_label.setAlignment(Qt.AlignCenter)
-        
-        self.annotation_dir_label = QLabel('保存目录: 未设置')
+        self.image_dir_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.image_dir_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.image_dir_label.setMinimumWidth(0)
+        self.image_dir_badge = QLabel('图像目录')
+        self.image_dir_badge.setObjectName('ImageDirBadge')
+        self.image_dir_badge.setAlignment(Qt.AlignCenter)
+
+        self.annotation_dir_label = QLabel('No annotation directory')
         self.annotation_dir_label.setObjectName("AnnotationDirLabel")
-        self.annotation_dir_label.setAlignment(Qt.AlignCenter)
-        
-        self.daily_total_label = QLabel('今日总计数: 0')
+        self.annotation_dir_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.annotation_dir_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.annotation_dir_label.setMinimumWidth(0)
+        self.annotation_dir_badge = QLabel('标注输出')
+        self.annotation_dir_badge.setObjectName('AnnotationDirBadge')
+        self.annotation_dir_badge.setAlignment(Qt.AlignCenter)
+
+        self.daily_total_label = QLabel('Today  0')
         self.daily_total_label.setObjectName("DailyTotalLabel")
-        self.daily_total_label.setAlignment(Qt.AlignCenter)
-        
+        self.daily_total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.document_title_label = QLabel('labelImg')
+        self.document_title_label.setObjectName('SectionTitle')
+        self.canvas_meta_label = QLabel('Open a directory to begin annotating')
+        self.canvas_meta_label.setObjectName('CanvasMeta')
+        self.canvas_meta_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.canvas_meta_label.setMinimumWidth(0)
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(0)
+        title_layout.addWidget(self.document_title_label)
+        title_layout.addWidget(self.canvas_meta_label)
+
+        image_dir_row = QWidget()
+        image_dir_row.setObjectName('ImageDirRow')
+        image_dir_row_layout = QHBoxLayout()
+        image_dir_row_layout.setContentsMargins(6, 4, 8, 4)
+        image_dir_row_layout.setSpacing(8)
+        image_dir_row_layout.addWidget(self.image_dir_badge)
+        image_dir_row_layout.addWidget(self.image_dir_label, 1)
+        image_dir_row.setLayout(image_dir_row_layout)
+
+        annotation_dir_row = QWidget()
+        annotation_dir_row.setObjectName('AnnotationDirRow')
+        annotation_dir_row_layout = QHBoxLayout()
+        annotation_dir_row_layout.setContentsMargins(6, 4, 8, 4)
+        annotation_dir_row_layout.setSpacing(8)
+        annotation_dir_row_layout.addWidget(self.annotation_dir_badge)
+        annotation_dir_row_layout.addWidget(self.annotation_dir_label, 1)
+        annotation_dir_row.setLayout(annotation_dir_row_layout)
+
+        directory_layout = QVBoxLayout()
+        directory_layout.setContentsMargins(0, 0, 0, 0)
+        directory_layout.setSpacing(5)
+        directory_layout.addWidget(image_dir_row)
+        directory_layout.addWidget(annotation_dir_row)
+
         dir_layout = QHBoxLayout()
-        dir_layout.setContentsMargins(10, 10, 10, 10)
-        dir_layout.setSpacing(15)
-        dir_layout.addWidget(self.image_dir_label, 1)
-        dir_layout.addWidget(self.annotation_dir_label, 1)
-        dir_layout.addWidget(self.daily_total_label, 1)
-        
+        dir_layout.setContentsMargins(16, 8, 16, 8)
+        dir_layout.setSpacing(12)
+        dir_layout.addLayout(title_layout, 1)
+        dir_layout.addLayout(directory_layout, 2)
+        dir_layout.addWidget(self.daily_total_label)
+
         dir_container = QWidget()
-        dir_container.setObjectName("DirContainer")
+        dir_container.setObjectName("CanvasHeader")
         dir_container.setLayout(dir_layout)
+
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.sliderReleased.connect(self.jump_to_slider_frame)
+        self.frame_position_label = QLabel('0 / 0')
+        self.frame_position_label.setObjectName('CanvasMeta')
+        self.frame_jump_spin = QSpinBox()
+        self.frame_jump_spin.setRange(1, 1)
+        self.frame_jump_spin.setPrefix('Frame  ')
+        self.frame_jump_spin.setEnabled(False)
+        self.frame_jump_spin.setKeyboardTracking(False)
+        self.frame_jump_spin.editingFinished.connect(self.jump_to_frame)
+        self.frame_jump_button = QPushButton('Go')
+        self.frame_jump_button.setObjectName('PrimaryActionButton')
+        self.frame_jump_button.setEnabled(False)
+        self.frame_jump_button.clicked.connect(self.jump_to_frame)
+        shortcut_hint = QLabel('A  Previous     D  Next     W  Draw     F  Delete')
+        shortcut_hint.setObjectName('ShortcutHint')
+        shortcut_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        shortcut_hint.setMinimumWidth(0)
+
+        timeline_layout = QHBoxLayout()
+        timeline_layout.setContentsMargins(14, 10, 14, 10)
+        timeline_layout.setSpacing(12)
+        timeline_layout.addWidget(self.frame_position_label)
+        timeline_layout.addWidget(self.frame_slider, 1)
+        timeline_layout.addWidget(self.frame_jump_spin)
+        timeline_layout.addWidget(self.frame_jump_button)
+        timeline_layout.addWidget(shortcut_hint)
+        timeline_container = QWidget()
+        timeline_container.setObjectName('TimelineBar')
+        timeline_container.setLayout(timeline_layout)
 
         central_layout = QVBoxLayout()
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
         central_layout.addWidget(dir_container)
-        central_layout.addWidget(scroll)
+        central_layout.addWidget(scroll, 1)
+        central_layout.addWidget(timeline_container)
         central_widget = QWidget()
         central_widget.setLayout(central_layout)
 
@@ -280,16 +538,23 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.shapeMoved.connect(self.set_dirty)
         self.canvas.selectionChanged.connect(self.shape_selection_changed)
         self.canvas.drawingPolygon.connect(self.toggle_drawing_sensitive)
+        self.canvas.imageRouteDragRequested.connect(self.start_image_route_drag)
 
         self.setCentralWidget(central_widget)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.file_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.file_dock)
-        self.file_dock.setFeatures(QDockWidget.DockWidgetFloatable)
+        self.file_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.resizeDocks([self.file_dock, self.dock], [240, 300], Qt.Horizontal)
 
         self.update_dir_labels()
 
-        self.dock_features = QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetFloatable
-        self.dock.setFeatures(self.dock.features() ^ self.dock_features)
+        self.dock_features = QDockWidget.NoDockWidgetFeatures
+        self.dock.setFeatures(self.dock_features)
+        self.refresh_image_routes()
+
+        settings['theme'] = 'Apple Pro'
+        apply_theme(QApplication.instance(), 'Apple Pro')
 
         # Actions
         action = partial(new_action, self)
@@ -301,6 +566,9 @@ class MainWindow(QMainWindow, WindowMixin):
 
         open_dir = action(get_str('openDir'), self.open_dir_dialog,
                           'Ctrl+u', 'open', get_str('openDir'))
+
+        open_last_exit_image = action('打开上次退出位置', self.open_last_exit_image,
+                                      None, 'open', '打开上次退出时所在图片')
 
         change_save_dir = action(get_str('changeSaveDir'), self.change_save_dir_dialog,
                                  'Ctrl+r', 'open', get_str('changeSavedAnnotationDir'))
@@ -496,9 +764,12 @@ class MainWindow(QMainWindow, WindowMixin):
             file=self.menu(get_str('menu_file')),
             edit=self.menu(get_str('menu_edit')),
             view=self.menu(get_str('menu_view')),
+            theme=self.menu('&Theme'),
             help=self.menu(get_str('menu_help')),
             recentFiles=QMenu(get_str('menu_openRecent')),
             labelList=label_menu)
+
+        self.theme_actions = {}
 
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
@@ -542,6 +813,16 @@ class MainWindow(QMainWindow, WindowMixin):
             zoom_in, zoom_out, zoom_org, None,
             fit_window, fit_width))
 
+        theme_menu = self.menus.theme
+        current_theme = settings.get('theme', CURRENT_THEME)
+        for theme_name in THEMES.keys():
+            theme_action = QAction(theme_name, self)
+            theme_action.setCheckable(True)
+            theme_action.setChecked(theme_name == current_theme)
+            theme_action.triggered.connect(lambda checked, name=theme_name: self.change_theme(name))
+            theme_menu.addAction(theme_action)
+            self.theme_actions[theme_name] = theme_action
+
         # 可选：也把批量复制动作加入“文件”菜单，靠近“从上一帧复制”
         add_actions(self.menus.file, (copy_next_5, copy_next_10, copy_next_25, copy_next_custom))
 
@@ -555,11 +836,11 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
+            open, open_dir, change_save_dir, open_last_exit_image, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width)
 
         self.actions.advanced = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, save, save_format, None,
+            open, open_dir, change_save_dir, open_last_exit_image, open_next_image, open_prev_image, save, save_format, None,
             create_mode, edit_mode, None,
             hide_all, show_all)
 
@@ -582,7 +863,15 @@ class MainWindow(QMainWindow, WindowMixin):
             if QApplication.desktop().availableGeometry(i).contains(saved_position):
                 position = saved_position
                 break
-        self.resize(size)
+        # Never restore a window larger than the desktop work area.
+        available_geometry = QApplication.desktop().availableGeometry(position)
+        width = min(max(1, size.width()), available_geometry.width())
+        height = min(max(1, size.height()), available_geometry.height())
+        position.setX(min(max(position.x(), available_geometry.left()),
+                          available_geometry.right() - width + 1))
+        position.setY(min(max(position.y(), available_geometry.top()),
+                          available_geometry.bottom() - height + 1))
+        self.resize(width, height)
         self.move(position)
         save_dir = ustr(settings.get(SETTING_SAVE_DIR, None))
         self.last_open_dir = ustr(settings.get(SETTING_LAST_OPEN_DIR, None))
@@ -593,6 +882,7 @@ class MainWindow(QMainWindow, WindowMixin):
             self.statusBar().show()
 
         self.restoreState(settings.get(SETTING_WIN_STATE, QByteArray()))
+        self._force_top_toolbar()
         Shape.line_color = self.line_color = QColor(settings.get(SETTING_LINE_COLOR, DEFAULT_LINE_COLOR))
         Shape.fill_color = self.fill_color = QColor(settings.get(SETTING_FILL_COLOR, DEFAULT_FILL_COLOR))
         self.canvas.set_drawing_color(self.line_color)
@@ -622,6 +912,13 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.populate_mode_actions()
         self.load_custom_shortcuts()
+
+        # Use the same application icon in the status bar and window chrome.
+        self.status_logo = QLabel()
+        self.status_logo.setObjectName('StatusLogo')
+        self.status_logo.setPixmap(new_icon('labelimg').pixmap(16, 16))
+        self.status_logo.setToolTip(__appname__)
+        self.statusBar().addPermanentWidget(self.status_logo)
 
         # Display cursor coordinates at the right of status bar
         self.label_coordinates = QLabel('')
@@ -694,6 +991,18 @@ class MainWindow(QMainWindow, WindowMixin):
         if shortcuts:
             self.apply_custom_shortcuts(shortcuts)
 
+    def change_theme(self, theme_name):
+        for name, theme_action in self.theme_actions.items():
+            theme_action.setChecked(name == theme_name)
+
+        apply_theme(QApplication.instance(), theme_name)
+        self.settings['theme'] = theme_name
+        self.settings.save()
+
+        for i in range(self.label_list.count()):
+            item = self.label_list.item(i)
+            self._set_label_item_style(item, item.text())
+
     def update_daily_stats(self, file_path):
         """更新每日图片打开统计"""
         if not file_path or os.path.isdir(file_path):
@@ -703,8 +1012,7 @@ class MainWindow(QMainWindow, WindowMixin):
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         
-        # 获取现有统计
-        stats = self.settings.get(SETTING_DAILY_STATS, {})
+        stats = self.daily_stats
         
         # 跨天清空逻辑：如果记录的日期不是今天，则重置
         if stats.get('date') != today_str:
@@ -722,20 +1030,33 @@ class MainWindow(QMainWindow, WindowMixin):
         abs_path = os.path.abspath(file_path)
         if abs_path not in stats['opened_files']:
             stats['opened_files'].add(abs_path)
-            
+
             dir_path = os.path.dirname(abs_path)
             stats['paths'][dir_path] = stats['paths'].get(dir_path, 0) + 1
-            
-            # 保存更新
+
+            self.daily_stats = stats
             self.settings[SETTING_DAILY_STATS] = stats
-            self.settings.save()
-            
-            # 实时更新 UI 上的总计数标签
+            self._daily_stats_save_pending = True
+            self._schedule_daily_stats_save()
             self.update_daily_total_label()
+
+    def _schedule_daily_stats_save(self):
+        if getattr(self, '_daily_stats_flush_scheduled', False):
+            return
+        self._daily_stats_flush_scheduled = True
+        QTimer.singleShot(500, self._flush_daily_stats)
+
+    def _flush_daily_stats(self):
+        self._daily_stats_flush_scheduled = False
+        if not self._daily_stats_save_pending:
+            return
+        self.settings[SETTING_DAILY_STATS] = self.daily_stats
+        self.settings.save()
+        self._daily_stats_save_pending = False
 
     def show_daily_stats_dialog(self):
         """显示每日统计明细对话框"""
-        stats = self.settings.get(SETTING_DAILY_STATS, {})
+        stats = self.daily_stats
         
         # 再次检查日期，防止对话框显示旧数据
         from datetime import datetime
@@ -779,6 +1100,7 @@ class MainWindow(QMainWindow, WindowMixin):
             tool, menu = self.actions.advanced, self.actions.advancedContext
         self.tools.clear()
         add_actions(self.tools, tool)
+        self._force_top_toolbar()
         self.canvas.menus[0].clear()
         add_actions(self.canvas.menus[0], menu)
         self.menus.edit.clear()
@@ -789,10 +1111,21 @@ class MainWindow(QMainWindow, WindowMixin):
     def set_beginner(self):
         self.tools.clear()
         add_actions(self.tools, self.actions.beginner)
+        self._force_top_toolbar()
 
     def set_advanced(self):
         self.tools.clear()
         add_actions(self.tools, self.actions.advanced)
+        self._force_top_toolbar()
+
+    def _force_top_toolbar(self):
+        if hasattr(self, 'tools'):
+            self.tools.setOrientation(Qt.Horizontal)
+            self.tools.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self.tools.setMovable(False)
+            self.tools.setAllowedAreas(Qt.TopToolBarArea)
+            if self.toolBarArea(self.tools) != Qt.TopToolBarArea:
+                self.addToolBar(Qt.TopToolBarArea, self.tools)
 
     def set_dirty(self):
         self.dirty = True
@@ -816,11 +1149,42 @@ class MainWindow(QMainWindow, WindowMixin):
             snapshot.append(shape.copy())
         
         self.undo_stack.append(snapshot)
+        self.undo_action_stack.append(('annotation', None))
         if len(self.undo_stack) > self.max_undo:
             self.undo_stack.pop(0)
+            self._remove_first_undo_action('annotation', None)
 
     def undo_last_operation(self):
-        """执行撤回操作，恢复到上一个状态快照"""
+        """按真实操作顺序撤回图片删除或标注快照。"""
+        while self.undo_action_stack:
+            action_type, payload = self.undo_action_stack.pop()
+            if action_type == 'image_delete':
+                if payload in self.deleted_image_stack:
+                    self.restore_deleted_image(payload)
+                    return
+                continue
+            if action_type == 'annotation' and self.undo_stack:
+                self.restore_last_annotation_snapshot()
+                return
+
+        if self.deleted_image_stack:
+            self.restore_last_deleted_image()
+            return
+
+        if self.undo_stack:
+            self.restore_last_annotation_snapshot()
+            return
+
+        self.status("没有可撤回的操作", 2000)
+
+    def _remove_first_undo_action(self, action_type, payload):
+        for index, action in enumerate(self.undo_action_stack):
+            if action == (action_type, payload):
+                self.undo_action_stack.pop(index)
+                return
+
+    def restore_last_annotation_snapshot(self):
+        """恢复到上一个标注状态快照。"""
         if not self.undo_stack:
             self.status("没有可撤回的操作", 2000)
             return
@@ -843,17 +1207,133 @@ class MainWindow(QMainWindow, WindowMixin):
         self.set_dirty()
         self.status("已撤回上一次操作", 2000)
 
+    def _delete_image_undo_dir(self):
+        undo_dir = os.path.join(tempfile.gettempdir(), 'labelImg_deleted_undo', str(os.getpid()))
+        os.makedirs(undo_dir, exist_ok=True)
+        return undo_dir
+
+    def _move_to_delete_undo(self, file_path):
+        basename = os.path.basename(file_path)
+        destination = os.path.join(
+            self._delete_image_undo_dir(),
+            '{}_{}'.format(len(self.deleted_image_stack), basename)
+        )
+        counter = 1
+        while os.path.exists(destination):
+            destination = os.path.join(
+                self._delete_image_undo_dir(),
+                '{}_{}_{}'.format(len(self.deleted_image_stack), counter, basename)
+            )
+            counter += 1
+        shutil.move(file_path, destination)
+        return destination
+
+    def _discard_deleted_image_record(self, record):
+        deleted_paths = [record.get('deleted_image_path')]
+        deleted_paths.extend([p for _, p in record.get('deleted_annotation_paths', [])])
+        for deleted_path in deleted_paths:
+            if deleted_path and os.path.exists(deleted_path):
+                try:
+                    os.remove(deleted_path)
+                except Exception:
+                    pass
+
+    def _push_deleted_image_record(self, record):
+        self.deleted_image_stack.append(record)
+        self.undo_action_stack.append(('image_delete', record))
+        while len(self.deleted_image_stack) > self.max_deleted_image_undo:
+            old_record = self.deleted_image_stack.pop(0)
+            self._remove_first_undo_action('image_delete', old_record)
+            self._discard_deleted_image_record(old_record)
+
+    def restore_last_deleted_image(self):
+        if not self.deleted_image_stack:
+            self.status("没有可撤回的图片删除", 2000)
+            return
+        self.restore_deleted_image(self.deleted_image_stack[-1])
+
+    def restore_deleted_image(self, record):
+        original_path = record['original_path']
+        deleted_path = record['deleted_image_path']
+        basename = os.path.basename(original_path)
+
+        if os.path.exists(original_path):
+            QMessageBox.warning(self, '撤回失败', '原位置已存在同名文件，无法恢复: {}'.format(basename))
+            return
+        if not os.path.exists(deleted_path):
+            QMessageBox.warning(self, '撤回失败', '临时删除文件不存在，无法恢复: {}'.format(basename))
+            return
+
+        try:
+            os.makedirs(os.path.dirname(original_path), exist_ok=True)
+            shutil.move(deleted_path, original_path)
+            for original_annotation_path, deleted_annotation_path in record.get('deleted_annotation_paths', []):
+                if os.path.exists(deleted_annotation_path):
+                    if not os.path.exists(original_annotation_path):
+                        os.makedirs(os.path.dirname(original_annotation_path), exist_ok=True)
+                        shutil.move(deleted_annotation_path, original_annotation_path)
+                    else:
+                        os.remove(deleted_annotation_path)
+        except Exception as e:
+            QMessageBox.warning(self, '撤回失败', '无法恢复文件: {}'.format(str(e)))
+            return
+
+        if record in self.deleted_image_stack:
+            self.deleted_image_stack.remove(record)
+        if ('image_delete', record) in self.undo_action_stack:
+            self.undo_action_stack.remove(('image_delete', record))
+
+        if original_path not in self.m_img_list:
+            index = min(record.get('index', len(self.m_img_list)), len(self.m_img_list))
+            self.m_img_list.insert(index, original_path)
+            self.img_count = len(self.m_img_list)
+            item = QListWidgetItem(os.path.basename(original_path))
+            item.setData(Qt.UserRole, original_path)
+            self.file_list_widget.insertItem(index, item)
+            self._rebuild_image_index()
+        if record.get('was_annotated') and original_path not in self._annotated_paths:
+            self._annotated_paths.add(original_path)
+            self._annotated_count_cache += 1
+
+        self.cur_img_idx = self._img_path_to_idx.get(original_path, 0)
+        self.update_frame_navigation()
+        self.update_dir_labels()
+        self.load_file(original_path)
+        self.status('已撤回删除: {}'.format(basename), 3000)
+
+    def _confirm_delete_image(self, basename):
+        if self.skip_delete_confirm:
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle('确认删除')
+        dialog.setText('确定要删除文件 "{}" 吗？'.format(basename))
+        dialog.setInformativeText('删除后可用 Ctrl+Z 撤回，最多保留最近5张。')
+        dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        dialog.setDefaultButton(QMessageBox.No)
+        checkbox = QCheckBox('本次使用不再提示')
+        dialog.setCheckBox(checkbox)
+        reply = dialog.exec_()
+        if reply == QMessageBox.Yes and checkbox.isChecked():
+            self.skip_delete_confirm = True
+        return reply == QMessageBox.Yes
+
     def set_clean(self):
         self.dirty = False
-        self.actions.save.setEnabled(False)
-        self.actions.create.setEnabled(True)
+        if self.actions.save.isEnabled():
+            self.actions.save.setEnabled(False)
+        if not self.actions.create.isEnabled():
+            self.actions.create.setEnabled(True)
 
     def toggle_actions(self, value=True):
         """Enable/Disable widgets which depend on an opened image."""
         for z in self.actions.zoomActions:
-            z.setEnabled(value)
+            if z.isEnabled() != value:
+                z.setEnabled(value)
         for action in self.actions.onLoadActive:
-            action.setEnabled(value)
+            if action.isEnabled() != value:
+                action.setEnabled(value)
 
     def queue_event(self, function):
         QTimer.singleShot(0, function)
@@ -861,7 +1341,7 @@ class MainWindow(QMainWindow, WindowMixin):
     def status(self, message, delay=5000):
         self.statusBar().showMessage(message, delay)
 
-    def reset_state(self):
+    def reset_state(self, reset_navigation=True):
         self.items_to_shapes.clear()
         self.shapes_to_items.clear()
         self.label_list.clear()
@@ -873,6 +1353,309 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.tech_timer.start(50)
         self.label_coordinates.clear()
         self.combo_box.cb.clear()
+        if hasattr(self, 'object_count_label'):
+            self.object_count_label.setText('0 labels')
+        if hasattr(self, 'selected_object_label'):
+            self.selected_object_label.setText('No object selected')
+        if reset_navigation:
+            if hasattr(self, 'frame_position_label'):
+                self.frame_position_label.setText('0 / 0')
+            if hasattr(self, 'frame_summary_label'):
+                self.frame_summary_label.setText('0 frames  •  0 labeled')
+            if hasattr(self, 'frame_slider'):
+                self.frame_slider.setRange(0, 0)
+                self.frame_slider.setValue(0)
+                self.frame_slider.setEnabled(False)
+            if hasattr(self, 'frame_jump_spin'):
+                self.frame_jump_spin.setRange(1, 1)
+                self.frame_jump_spin.setValue(1)
+                self.frame_jump_spin.setEnabled(False)
+            if hasattr(self, 'frame_jump_button'):
+                self.frame_jump_button.setEnabled(False)
+        if hasattr(self, 'labeling_progress'):
+            self.labeling_progress.setRange(0, 1)
+            self.labeling_progress.setValue(0)
+
+    def _rebuild_image_index(self):
+        self._img_path_to_idx = {path: index for index, path in enumerate(self.m_img_list)}
+
+    def _cache_remove(self, key):
+        self._image_cache.pop(key, None)
+        self._pixmap_cache.pop(key, None)
+
+    def update_frame_navigation(self):
+        self.img_count = len(self.m_img_list)
+        if self.file_path in self._img_path_to_idx:
+            self.cur_img_idx = self._img_path_to_idx[self.file_path]
+        total = self.img_count
+
+        if hasattr(self, 'frame_slider'):
+            self.frame_slider.blockSignals(True)
+            self.frame_slider.setEnabled(total > 0)
+            self.frame_slider.setRange(0, max(0, total - 1))
+            self.frame_slider.setValue(self.cur_img_idx if total > 0 else 0)
+            self.frame_slider.blockSignals(False)
+
+        if hasattr(self, 'frame_jump_spin'):
+            self.frame_jump_spin.blockSignals(True)
+            self.frame_jump_spin.setEnabled(total > 0)
+            self.frame_jump_spin.setRange(1, max(1, total))
+            self.frame_jump_spin.setValue(min(max(self.cur_img_idx + 1, 1), max(1, total)))
+            self.frame_jump_spin.blockSignals(False)
+
+        if hasattr(self, 'frame_position_label'):
+            if total > 0:
+                self.frame_position_label.setText(f'{self.cur_img_idx + 1} / {total}')
+            else:
+                self.frame_position_label.setText('0 / 0')
+
+    def update_frame_position_controls(self):
+        total = len(self.m_img_list)
+        if self.file_path in self._img_path_to_idx:
+            self.cur_img_idx = self._img_path_to_idx[self.file_path]
+        if hasattr(self, 'frame_position_label'):
+            self.frame_position_label.setText(f'{self.cur_img_idx + 1} / {total}' if total else '0 / 0')
+        if hasattr(self, 'frame_slider'):
+            self.frame_slider.blockSignals(True)
+            self.frame_slider.setEnabled(total > 0)
+            self.frame_slider.setRange(0, max(0, total - 1))
+            if self.frame_slider.value() != self.cur_img_idx:
+                self.frame_slider.setValue(self.cur_img_idx if total else 0)
+            self.frame_slider.blockSignals(False)
+        if hasattr(self, 'frame_jump_spin'):
+            self.frame_jump_spin.blockSignals(True)
+            self.frame_jump_spin.setEnabled(total > 0)
+            self.frame_jump_spin.setRange(1, max(1, total))
+            target_value = min(max(self.cur_img_idx + 1, 1), max(1, total))
+            if self.frame_jump_spin.value() != target_value:
+                self.frame_jump_spin.setValue(target_value)
+            self.frame_jump_spin.blockSignals(False)
+        if hasattr(self, 'frame_jump_button'):
+            self.frame_jump_button.setEnabled(total > 0)
+
+    def filter_frame_list(self, text=''):
+        needle = ustr(text).strip().lower()
+        for i in range(self.file_list_widget.count()):
+            item = self.file_list_widget.item(i)
+            file_path = ustr(item.data(Qt.UserRole) or item.text())
+            name = os.path.basename(file_path).lower()
+            item.setHidden(bool(needle) and needle not in name)
+
+    def jump_to_slider_frame(self):
+        if not self.m_img_list:
+            return
+        self.jump_to_index(self.frame_slider.value())
+
+    def jump_to_frame(self):
+        if not self.m_img_list:
+            return
+        self.frame_jump_spin.interpretText()
+        index = self.frame_jump_spin.value() - 1
+        self.jump_to_index(index)
+
+    def jump_to_index(self, index):
+        if not self.m_img_list:
+            return
+        if 0 <= index < len(self.m_img_list):
+            self.cur_img_idx = index
+            self.load_file(self.m_img_list[index])
+
+    def _normalise_image_routes(self, routes):
+        normalised = []
+        if not isinstance(routes, (list, tuple)):
+            return normalised
+        for route in routes[:9]:
+            if not isinstance(route, dict):
+                continue
+            name = ustr(route.get('name', '')).strip()
+            path = os.path.abspath(ustr(route.get('path', '')).strip())
+            if name and path:
+                normalised.append({'name': name, 'path': path})
+        return normalised
+
+    def add_image_route(self):
+        if len(self.image_routes) >= 9:
+            QMessageBox.information(self, 'Image Routing', '最多支持 9 个分流类别。')
+            return
+        name, ok = QInputDialog.getText(self, '新增分流类别', '类别名称：')
+        name = ustr(name).strip()
+        if not ok or not name:
+            return
+        start_dir = self.image_routes[-1]['path'] if self.image_routes else (self.last_open_dir or '.')
+        path = ustr(QFileDialog.getExistingDirectory(
+            self, '选择“{}”的目标目录'.format(name), start_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+        if not path:
+            return
+        self.image_routes.append({'name': name, 'path': os.path.abspath(path)})
+        self._save_image_routes()
+        self.refresh_image_routes()
+
+    def edit_image_route(self, route_index, anchor_button=None):
+        if not 0 <= route_index < len(self.image_routes):
+            return
+        route = self.image_routes[route_index]
+        menu = QMenu(self)
+        change_name = menu.addAction('修改名称')
+        change_path = menu.addAction('修改目录')
+        remove_route = menu.addAction('删除此类别')
+        position = (anchor_button.mapToGlobal(anchor_button.rect().bottomLeft())
+                    if anchor_button else QCursor.pos())
+        selected = menu.exec_(position)
+        if selected == change_name:
+            name, ok = QInputDialog.getText(
+                self, '修改类别名称', '类别名称：', text=route['name'])
+            name = ustr(name).strip()
+            if ok and name:
+                route['name'] = name
+        elif selected == change_path:
+            path = ustr(QFileDialog.getExistingDirectory(
+                self, '选择目标目录', route['path'],
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks))
+            if path:
+                route['path'] = os.path.abspath(path)
+        elif selected == remove_route:
+            self.image_routes.pop(route_index)
+        else:
+            return
+        self._save_image_routes()
+        self.refresh_image_routes()
+
+    def _save_image_routes(self):
+        self.settings[SETTING_IMAGE_ROUTES] = list(self.image_routes)
+        try:
+            self.settings.save()
+        except OSError:
+            self.status('分流配置保存失败', 3000)
+
+    def refresh_image_routes(self):
+        while self.route_targets_layout.count():
+            item = self.route_targets_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for shortcut in self.route_shortcuts:
+            shortcut.setParent(None)
+            shortcut.deleteLater()
+        self.route_shortcuts = []
+
+        if not self.image_routes:
+            empty = QLabel('Add a category and destination folder')
+            empty.setObjectName('MutedLabel')
+            empty.setWordWrap(True)
+            self.route_targets_layout.addWidget(empty)
+            return
+
+        for index, route in enumerate(self.image_routes):
+            button = RouteTargetButton(index, self.route_targets_container)
+            shortcut_text = 'Ctrl+Alt+{}'.format(index + 1)
+            button.setText('{}   {}'.format(shortcut_text, route['name']))
+            button.setToolTip(route['path'])
+            button.clicked.connect(partial(self.route_current_image, index))
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(
+                lambda _pos, idx=index, anchor=button: self.edit_image_route(idx, anchor))
+            button.imageDropped.connect(self.route_current_image)
+            self.route_targets_layout.addWidget(button)
+
+            shortcut = QShortcut(QKeySequence(shortcut_text), self)
+            shortcut.activated.connect(partial(self.route_current_image, index))
+            self.route_shortcuts.append(shortcut)
+
+    def start_image_route_drag(self):
+        if self._loading_file or not self.file_path or not self.image_routes:
+            self.status('请先添加至少一个分流类别', 3000)
+            return
+        self.routing_tab_button.setChecked(True)
+        self.inspector_stack.setCurrentIndex(1)
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        mime_data = QMimeData()
+        mime_data.setData(
+            'application/x-labelimg-current-image',
+            QByteArray(self.file_path.encode('utf-8')))
+        drag = QDrag(self.canvas)
+        drag.setMimeData(mime_data)
+        if not self.canvas.pixmap.isNull():
+            preview = self.canvas.pixmap.scaled(
+                160, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            drag.setPixmap(preview)
+            drag.setHotSpot(QPoint(preview.width() // 2, preview.height() // 2))
+        drag.exec_(Qt.MoveAction)
+
+    def route_current_image(self, route_index):
+        if self._loading_file or not self.file_path:
+            return False
+        if not 0 <= route_index < len(self.image_routes):
+            return False
+        if self.dirty and not self.may_continue():
+            return False
+
+        source_path = self.file_path
+        if not os.path.isfile(source_path):
+            self.status('当前图片不存在，无法分流', 3000)
+            return False
+        route = self.image_routes[route_index]
+        destination_dir = route['path']
+        try:
+            os.makedirs(destination_dir, exist_ok=True)
+            destination_path = self._unique_destination_path(
+                destination_dir, os.path.basename(source_path))
+            shutil.move(source_path, destination_path)
+        except OSError as error:
+            QMessageBox.warning(
+                self, '图片分流失败',
+                '无法移动到“{}”：\n{}'.format(route['name'], error))
+            return False
+
+        self._remove_routed_image(source_path)
+        self.status(
+            '已移动到 {}：{}'.format(route['name'], os.path.basename(destination_path)),
+            5000)
+        return True
+
+    def _unique_destination_path(self, destination_dir, basename):
+        destination_path = os.path.join(destination_dir, basename)
+        if not os.path.exists(destination_path):
+            return destination_path
+        stem, extension = os.path.splitext(basename)
+        counter = 1
+        while True:
+            destination_path = os.path.join(
+                destination_dir, '{}_{:03d}{}'.format(stem, counter, extension))
+            if not os.path.exists(destination_path):
+                return destination_path
+            counter += 1
+
+    def _remove_routed_image(self, source_path):
+        index = self._img_path_to_idx.get(source_path, -1)
+        if index < 0:
+            return
+        self.canvas.set_interaction_blocked(True)
+        self.canvas.setEnabled(False)
+        try:
+            self._cache_remove(source_path)
+            self.m_img_list.pop(index)
+            self.img_count = len(self.m_img_list)
+            self._img_path_to_idx.pop(source_path, None)
+            for new_index in range(index, self.img_count):
+                self._img_path_to_idx[self.m_img_list[new_index]] = new_index
+            if source_path in self._annotated_paths:
+                self._annotated_paths.remove(source_path)
+                self._annotated_count_cache = max(0, self._annotated_count_cache - 1)
+            list_item = self.file_list_widget.takeItem(index)
+            del list_item
+
+            if self.img_count:
+                self.cur_img_idx = min(index, self.img_count - 1)
+                self.file_path = None
+                self.load_file(self.m_img_list[self.cur_img_idx])
+            else:
+                self.reset_state()
+                self.setWindowTitle(__appname__)
+                self.toggle_actions(False)
+            self.update_frame_navigation()
+        finally:
+            self.canvas.set_interaction_blocked(False)
 
     def current_item(self):
         items = self.label_list.selectedItems()
@@ -1060,10 +1843,23 @@ class MainWindow(QMainWindow, WindowMixin):
 
     # Tzutalin 20160906 : Add file list and dock to move faster
     def file_item_double_clicked(self, item=None):
-        self.cur_img_idx = self.m_img_list.index(ustr(item.text()))
-        filename = self.m_img_list[self.cur_img_idx]
-        if filename:
-            self.load_file(filename)
+        file_path = ustr(item.data(Qt.UserRole) or item.text())
+        if file_path in self._img_path_to_idx:
+            self.cur_img_idx = self._img_path_to_idx[file_path]
+            self.load_file(file_path)
+
+    def file_list_context_menu(self, pos):
+        item = self.file_list_widget.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        delete_action = menu.addAction('删除此图片')
+        selected = menu.exec_(self.file_list_widget.mapToGlobal(pos))
+        if selected == delete_action:
+            self.delete_image(ustr(item.data(Qt.UserRole) or item.text()), confirm=True)
+
+    def delete_file_from_list(self, item):
+        self.delete_image(ustr(item.data(Qt.UserRole) or item.text()), confirm=True)
 
     # Add chris
     def button_state(self, item=None):
@@ -1102,16 +1898,20 @@ class MainWindow(QMainWindow, WindowMixin):
                 if shape in self.shapes_to_items:
                     self.shapes_to_items[shape].setSelected(True)
                 else:
-                    # 映射不存在时尝试刷新映射或忽略，防止 KeyError 导致闪退
                     pass
             else:
                 self.label_list.clearSelection()
+        if hasattr(self, 'selected_object_label'):
+            if selected and self.canvas.selected_shape:
+                shape = self.canvas.selected_shape
+                self.selected_object_label.setText(shape.label or 'Selected object')
+            else:
+                self.selected_object_label.setText('No object selected')
         self.actions.delete.setEnabled(selected)
         self.actions.copy.setEnabled(selected)
         self.actions.edit.setEnabled(selected)
         self.actions.shapeLineColor.setEnabled(selected)
         self.actions.shapeFillColor.setEnabled(selected)
-        # 选中时启用批量复制动作
         if hasattr(self.actions, 'copyNext5'):
             self.actions.copyNext5.setEnabled(selected)
         if hasattr(self.actions, 'copyNext10'):
@@ -1134,12 +1934,31 @@ class MainWindow(QMainWindow, WindowMixin):
 
     def _set_label_item_style(self, item, label_text):
         color = generate_color_by_text(label_text)
-        # 标签列表颜色使用不透明背景，避免主题透明叠加后看起来“同色”
         solid = QColor(color.red(), color.green(), color.blue(), 255)
-        item.setBackground(QBrush(solid))
-        # 根据亮度自动设置前景色，保证可读性
-        luminance = (0.299 * solid.red() + 0.587 * solid.green() + 0.114 * solid.blue())
-        item.setForeground(QBrush(QColor(20, 20, 20) if luminance > 160 else QColor(245, 245, 245)))
+
+        theme_info = THEMES.get(CURRENT_THEME, THEMES["Apple Pro"])
+        bg_color = QColor(theme_info['panel_bg'])
+        bg_luminance = (0.299 * bg_color.red() + 0.587 * bg_color.green() + 0.114 * bg_color.blue())
+        text_color = QColor(solid)
+        if bg_luminance < 128:
+            text_color.setHsv(text_color.hue(), max(150, text_color.saturation()),
+                              max(220, text_color.value()))
+        else:
+            text_color.setHsv(text_color.hue(), max(120, text_color.saturation()),
+                              min(190, text_color.value()))
+        item.setForeground(QBrush(text_color))
+        item.setBackground(QBrush(QColor(solid.red(), solid.green(), solid.blue(),
+                                         42 if bg_luminance < 128 else 28)))
+
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(solid))
+        painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
+        painter.drawEllipse(2, 2, 14, 14)
+        painter.end()
+        item.setIcon(QIcon(pixmap))
 
     def remove_label(self, shape):
         if shape is None:
@@ -1339,6 +2158,18 @@ class MainWindow(QMainWindow, WindowMixin):
         bar = self.scroll_bars[orientation]
         bar.setValue(int(bar.value() + bar.singleStep() * units))
 
+    def eventFilter(self, watched, event):
+        if watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                delta = event.angleDelta().y() if hasattr(event, 'angleDelta') else event.delta()
+                if delta:
+                    canvas_pos = self.canvas.mapFromGlobal(
+                        watched.mapToGlobal(event.pos()))
+                    self.zoom_request(delta, canvas_pos)
+                    event.accept()
+                    return True
+        return super(MainWindow, self).eventFilter(watched, event)
+
     def set_zoom(self, value):
         self.actions.fitWidth.setChecked(False)
         self.actions.fitWindow.setChecked(False)
@@ -1348,57 +2179,21 @@ class MainWindow(QMainWindow, WindowMixin):
     def add_zoom(self, increment=10):
         self.set_zoom(self.zoom_widget.value() + increment)
 
-    def zoom_request(self, delta):
-        # get the current scrollbar positions
-        # calculate the percentages ~ coordinates
+    def zoom_request(self, delta, cursor_pos):
         h_bar = self.scroll_bars[Qt.Horizontal]
         v_bar = self.scroll_bars[Qt.Vertical]
 
-        # get the current maximum, to know the difference after zooming
-        h_bar_max = h_bar.maximum()
-        v_bar_max = v_bar.maximum()
-
-        # get the cursor position and canvas size
-        # calculate the desired movement from 0 to 1
-        # where 0 = move left
-        #       1 = move right
-        # up and down analogous
-        cursor = QCursor()
-        pos = cursor.pos()
-        relative_pos = QWidget.mapFromGlobal(self, pos)
-
-        cursor_x = relative_pos.x()
-        cursor_y = relative_pos.y()
-
-        w = self.scroll_area.width()
-        h = self.scroll_area.height()
-
-        # the scaling from 0 to 1 has some padding
-        # you don't have to hit the very leftmost pixel for a maximum-left movement
-        margin = 0.1
-        move_x = (cursor_x - margin * w) / (w - 2 * margin * w)
-        move_y = (cursor_y - margin * h) / (h - 2 * margin * h)
-
-        # clamp the values from 0 to 1
-        move_x = min(max(move_x, 0), 1)
-        move_y = min(max(move_y, 0), 1)
-
-        # zoom in
+        image_pos = self.canvas.transform_pos(cursor_pos)
+        viewport_pos = self.scroll_area.viewport().mapFromGlobal(
+            self.canvas.mapToGlobal(cursor_pos))
         units = delta / (8 * 15)
-        scale = 10
-        self.add_zoom(scale * units)
+        self.add_zoom(10 * units)
 
-        # get the difference in scrollbar values
-        # this is how far we can move
-        d_h_bar_max = h_bar.maximum() - h_bar_max
-        d_v_bar_max = v_bar.maximum() - v_bar_max
-
-        # get the new scrollbar values
-        new_h_bar_value = h_bar.value() + move_x * d_h_bar_max
-        new_v_bar_value = v_bar.value() + move_y * d_v_bar_max
-
-        h_bar.setValue(int(new_h_bar_value))
-        v_bar.setValue(int(new_v_bar_value))
+        # Project the same image point back into the resized canvas, then
+        # align it with its original position inside the viewport.
+        scaled_pos = self.canvas.scale * (image_pos + self.canvas.offset_to_center())
+        h_bar.setValue(int(scaled_pos.x() - viewport_pos.x()))
+        v_bar.setValue(int(scaled_pos.y() - viewport_pos.y()))
 
     def set_fit_window(self, value=True):
         if value:
@@ -1419,11 +2214,14 @@ class MainWindow(QMainWindow, WindowMixin):
     def load_file(self, file_path=None):
         """Load the specified file, or the last opened file if None."""
         self._suspend_auto_save = True
-        self.reset_state()
+        # Preserve frame controls during navigation to avoid a visible 0 / 0 flash.
+        self.reset_state(reset_navigation=False)
         self.canvas.setEnabled(False)
         try:
             if file_path is None:
                 file_path = self.settings.get(SETTING_FILENAME)
+            if not file_path:
+                return False
 
             # 每日图片统计逻辑
             self.update_daily_stats(file_path)
@@ -1437,10 +2235,13 @@ class MainWindow(QMainWindow, WindowMixin):
             # Tzutalin 20160906 : Add file list and dock to move faster
             # Highlight the file item
             if unicode_file_path and self.file_list_widget.count() > 0:
-                if unicode_file_path in self.m_img_list:
-                    index = self.m_img_list.index(unicode_file_path)
+                index = self._img_path_to_idx.get(unicode_file_path)
+                if index is not None:
                     file_widget_item = self.file_list_widget.item(index)
-                    file_widget_item.setSelected(True)
+                    if file_widget_item is not None and not file_widget_item.isSelected():
+                        self.file_list_widget.blockSignals(True)
+                        file_widget_item.setSelected(True)
+                        self.file_list_widget.blockSignals(False)
                 else:
                     self.file_list_widget.clear()
                     self.m_img_list.clear()
@@ -1495,6 +2296,14 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.image = image
                 self.file_path = unicode_file_path
                 self.canvas.load_pixmap(pixmap)
+                if unicode_file_path not in self._img_path_to_idx:
+                    self.m_img_list = [unicode_file_path]
+                    self.file_list_widget.clear()
+                    item = QListWidgetItem(os.path.basename(unicode_file_path))
+                    item.setData(Qt.UserRole, unicode_file_path)
+                    self.file_list_widget.addItem(item)
+                    self._rebuild_image_index()
+                    self.img_count = 1
                 if self.label_file:
                     self.load_labels(self.label_file.shapes)
 
@@ -1519,6 +2328,7 @@ class MainWindow(QMainWindow, WindowMixin):
                     self.label_list.item(self.label_list.count() - 1).setSelected(True)
 
                 self.canvas.setFocus(True)
+                self.update_frame_position_controls()
                 self._preload_adjacent()
                 return True
             return False
@@ -1526,10 +2336,16 @@ class MainWindow(QMainWindow, WindowMixin):
             self._suspend_auto_save = False
 
     def _preload_adjacent(self):
+        self._preload_request_id = getattr(self, '_preload_request_id', 0) + 1
+        request_id = self._preload_request_id
+        QTimer.singleShot(150, lambda: self._run_preload_adjacent(request_id))
+
+    def _run_preload_adjacent(self, request_id):
+        if request_id != getattr(self, '_preload_request_id', 0):
+            return
         from threading import Thread
-        try:
-            idx = self.m_img_list.index(self.file_path)
-        except ValueError:
+        idx = self._img_path_to_idx.get(self.file_path, -1)
+        if idx < 0:
             return
         image_cache = self._image_cache
         paths = []
@@ -1542,11 +2358,15 @@ class MainWindow(QMainWindow, WindowMixin):
             return
         def _load():
             for path in paths:
+                if request_id != getattr(self, '_preload_request_id', 0):
+                    return
                 if path in image_cache:
                     continue
                 try:
                     img = read(path, None)
                     if img is not None and not img.isNull():
+                        if request_id != getattr(self, '_preload_request_id', 0):
+                            return
                         image_cache[path] = img
                         if len(image_cache) > 50:
                             oldest = list(image_cache.keys())[0]
@@ -1598,14 +2418,11 @@ class MainWindow(QMainWindow, WindowMixin):
             self.canvas.pixmap = QPixmap() # ensure pixmap is completely null to show animation
             self.canvas.tech_timer.start(50)
             return '[0 / 0]'
-        
+
         total_images = len(self.m_img_list)
-        current_index = self.m_img_list.index(self.file_path) if self.file_path in self.m_img_list else 0
-        
-        # Count annotated images
-        annotated_count = sum(1 for img_path in self.m_img_list 
-                             if self.hasAnnotationFile(img_path))
-        
+        current_index = self._img_path_to_idx.get(self.file_path, 0)
+        annotated_count = getattr(self, '_annotated_count_cache', len(getattr(self, '_annotated_paths', set())))
+
         return '[{} / {} | 已标注: {} / {} ({:.1f}%)]'.format(
             current_index + 1, 
             total_images,
@@ -1667,6 +2484,20 @@ class MainWindow(QMainWindow, WindowMixin):
             self.adjust_scale()
         super(MainWindow, self).resizeEvent(event)
 
+    def changeEvent(self, event):
+        super(MainWindow, self).changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and self.isMaximized():
+            QTimer.singleShot(0, self._fit_maximized_window)
+
+    def _fit_maximized_window(self):
+        if not self.isMaximized():
+            return
+        desktop = QApplication.desktop()
+        screen = desktop.screenNumber(self)
+        available_geometry = desktop.availableGeometry(screen)
+        if not available_geometry.contains(self.geometry()):
+            self.setGeometry(available_geometry)
+
     def paint_canvas(self):
         assert not self.image.isNull(), "cannot paint null image"
         self.canvas.scale = 0.01 * self.zoom_widget.value()
@@ -1704,6 +2535,7 @@ class MainWindow(QMainWindow, WindowMixin):
             settings[SETTING_FILENAME] = self.file_path if self.file_path else ''
         else:
             settings[SETTING_FILENAME] = ''
+        settings[SETTING_LAST_EXIT_IMAGE] = self.file_path if self.file_path else ''
 
         settings[SETTING_WIN_SIZE] = self.size()
         settings[SETTING_WIN_POSE] = self.pos()
@@ -1730,13 +2562,52 @@ class MainWindow(QMainWindow, WindowMixin):
         settings[SETTING_FAST_ANNOTATE] = self.fast_annotate_checkbox.isChecked()
         settings[SETTING_DRAW_SQUARE] = self.draw_squares_option.isChecked()
         settings[SETTING_LABEL_FILE_FORMAT] = self.label_file_format
+        settings[SETTING_IMAGE_ROUTES] = list(getattr(self, 'image_routes', []))
+        settings[SETTING_DAILY_STATS] = self.daily_stats
         settings[SETTING_SINGLE_TARGET] = self.single_target_checkbox.isChecked()
         settings[SETTING_FAST_ANNOTATE] = self.fast_annotate_checkbox.isChecked()
         settings.save()
+        self._daily_stats_save_pending = False
 
     def load_recent(self, filename):
         if self.may_continue():
             self.load_file(filename)
+
+    def open_last_exit_image(self):
+        last_image = ustr(self.settings.get(SETTING_LAST_EXIT_IMAGE, ''))
+        if not last_image or not os.path.exists(last_image):
+            QMessageBox.information(self, '打开上次退出位置', '没有可恢复的上次退出图片。')
+            return
+        if not self.may_continue():
+            return
+
+        last_dir = os.path.dirname(last_image)
+        self.last_open_dir = last_dir
+        self.dir_name = last_dir
+        self.file_path = None
+        self.file_list_widget.clear()
+        self.m_img_list = self.scan_all_images(last_dir)
+        self.img_count = len(self.m_img_list)
+        self._rebuild_image_index()
+        self._annotated_paths = set()
+        self._annotated_count_cache = 0
+        self._annotated_dirty = False
+
+        self.file_list_widget.setUpdatesEnabled(False)
+        self.file_list_widget.setUniformItemSizes(True)
+        for img_path in self.m_img_list:
+            item = QListWidgetItem(os.path.basename(img_path))
+            item.setData(Qt.UserRole, img_path)
+            self.file_list_widget.addItem(item)
+        self.file_list_widget.setUpdatesEnabled(True)
+
+        index = self._img_path_to_idx.get(last_image)
+        if index is None:
+            QMessageBox.information(self, '打开上次退出位置', '上次退出图片不在当前目录图片列表中。')
+            return
+        self.cur_img_idx = index
+        self.update_frame_navigation()
+        self.load_file(last_image)
 
     def scan_all_images(self, folder_path):
         extensions = ['.%s' % fmt.data().decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()]
@@ -1814,10 +2685,18 @@ class MainWindow(QMainWindow, WindowMixin):
         self.file_list_widget.clear()
         self.m_img_list = self.scan_all_images(dir_path)
         self.img_count = len(self.m_img_list)
-        self.open_next_image()
+        self._rebuild_image_index()
+        self._annotated_paths = set()
+        self._annotated_count_cache = 0
+        self._annotated_dirty = False
+        self.file_list_widget.setUpdatesEnabled(False)
+        self.file_list_widget.setUniformItemSizes(True)
         for imgPath in self.m_img_list:
-            item = QListWidgetItem(imgPath)
+            item = QListWidgetItem(os.path.basename(imgPath))
+            item.setData(Qt.UserRole, imgPath)
             self.file_list_widget.addItem(item)
+        self.file_list_widget.setUpdatesEnabled(True)
+        self.open_next_image()
 
     def verify_image(self, _value=False):
         # Proceeding next image without dialog if having any label
@@ -1846,7 +2725,7 @@ class MainWindow(QMainWindow, WindowMixin):
             if not self.may_continue():
                 return
 
-        if self.img_count <= 0:
+        if self.img_count <= 0 or not self.m_img_list:
             return
 
         if self.file_path is None:
@@ -1867,7 +2746,7 @@ class MainWindow(QMainWindow, WindowMixin):
             if not self.may_continue():
                 return
 
-        if self.img_count <= 0:
+        if self.img_count <= 0 or not self.m_img_list:
             return
 
         filename = None
@@ -1893,6 +2772,7 @@ class MainWindow(QMainWindow, WindowMixin):
         if filename:
             if isinstance(filename, (tuple, list)):
                 filename = filename[0]
+            filename = os.path.abspath(ustr(filename))
             self.cur_img_idx = 0
             self.img_count = 1
             self.load_file(filename)
@@ -1959,15 +2839,75 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.setEnabled(False)
         self.actions.saveAs.setEnabled(False)
 
-    def delete_image(self):
-        delete_path = self.file_path
-        if delete_path is not None:
-            self.open_next_image()
-            self.cur_img_idx -= 1
-            self.img_count -= 1
-            if os.path.exists(delete_path):
-                os.remove(delete_path)
-            self.import_dir_images(self.last_open_dir)
+    def delete_image(self, delete_path=None, confirm=True):
+        if isinstance(delete_path, bool):
+            delete_path = None
+        delete_path = ustr(delete_path or self.file_path)
+        if not delete_path:
+            return
+
+        basename = os.path.basename(delete_path)
+        if confirm and not self._confirm_delete_image(basename):
+            return
+
+        image_index = self._img_path_to_idx.get(delete_path, -1)
+        deleting_current = (delete_path == self.file_path)
+        image_stem = os.path.splitext(delete_path)[0]
+        annotation_paths = [image_stem + ext for ext in (XML_EXT, TXT_EXT, JSON_EXT)]
+        if self.default_save_dir:
+            annotation_stem = os.path.join(
+                self.default_save_dir, os.path.basename(image_stem))
+            annotation_paths.extend(
+                annotation_stem + ext for ext in (XML_EXT, TXT_EXT, JSON_EXT))
+
+        record = {
+            'original_path': delete_path,
+            'deleted_image_path': None,
+            'deleted_annotation_paths': [],
+            'index': image_index if image_index >= 0 else len(self.m_img_list),
+            'was_annotated': delete_path in self._annotated_paths,
+        }
+
+        try:
+            record['deleted_image_path'] = self._move_to_delete_undo(delete_path)
+        except Exception as e:
+            QMessageBox.warning(self, '删除失败', '无法删除文件: {}'.format(str(e)))
+            return
+
+        seen = set()
+        for ap in annotation_paths:
+            if not ap or ap in seen:
+                continue
+            seen.add(ap)
+            if os.path.exists(ap):
+                try:
+                    moved_ap = self._move_to_delete_undo(ap)
+                    record['deleted_annotation_paths'].append((ap, moved_ap))
+                except Exception:
+                    pass
+
+        self._push_deleted_image_record(record)
+
+        if image_index >= 0 and delete_path in self.m_img_list:
+            self.m_img_list.pop(image_index)
+            self.img_count = len(self.m_img_list)
+            self._rebuild_image_index()
+            self.file_list_widget.takeItem(image_index)
+            if delete_path in self._annotated_paths:
+                self._annotated_paths.remove(delete_path)
+                self._annotated_count_cache = max(0, self._annotated_count_cache - 1)
+            self.update_frame_navigation()
+
+        if deleting_current:
+            if self.img_count > 0:
+                self.cur_img_idx = min(image_index, self.img_count - 1) if image_index >= 0 else 0
+                self.load_file(self.m_img_list[self.cur_img_idx])
+            else:
+                self.reset_state()
+                self.setWindowTitle(__appname__)
+                self.toggle_actions(False)
+
+        self.status('已删除: {}，按 Ctrl+Z 可撤回'.format(basename))
 
     def reset_all(self):
         self.settings.reset()
@@ -2148,7 +3088,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.verified = create_ml_parse_reader.verified
 
     def copy_previous_bounding_boxes(self):
-        current_index = self.m_img_list.index(self.file_path)
+        current_index = self._img_path_to_idx.get(self.file_path, 0)
         if current_index - 1 >= 0:
             prev_file_path = self.m_img_list[current_index - 1]
             self.show_bounding_box_from_annotation_file(prev_file_path)
@@ -2192,7 +3132,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # 执行复制
         try:
-            current_index = self.m_img_list.index(self.file_path)
+            current_index = self._img_path_to_idx.get(self.file_path, 0)
         except ValueError:
             QMessageBox.warning(self, '警告', '当前文件不在图片列表中，无法定位后续帧。')
             return
@@ -2326,9 +3266,8 @@ class MainWindow(QMainWindow, WindowMixin):
             return
 
         from libs.similarity import find_similar_range
-        try:
-            current_index = self.m_img_list.index(self.file_path)
-        except ValueError:
+        current_index = self._img_path_to_idx.get(self.file_path, -1)
+        if current_index < 0:
             return
 
         similar_count, _ = find_similar_range(self.m_img_list, current_index)
@@ -2359,17 +3298,23 @@ class MainWindow(QMainWindow, WindowMixin):
                 dir_path = os.path.dirname(self.file_path)
             
             if dir_path:
-                self.image_dir_label.setText(f'图片目录: {dir_path}')
+                display_path = QFontMetrics(self.image_dir_label.font()).elidedText(
+                    dir_path, Qt.ElideMiddle, 260)
+                self.image_dir_label.setText(display_path)
                 self.image_dir_label.setToolTip(dir_path)
             else:
-                self.image_dir_label.setText('图片目录: 未设置')
+                self.image_dir_label.setText('未设置')
+                self.image_dir_label.setToolTip('')
         
         if self.annotation_dir_label:
             if self.default_save_dir:
-                self.annotation_dir_label.setText(f'保存目录: {self.default_save_dir}')
+                display_path = QFontMetrics(self.annotation_dir_label.font()).elidedText(
+                    self.default_save_dir, Qt.ElideMiddle, 260)
+                self.annotation_dir_label.setText(display_path)
                 self.annotation_dir_label.setToolTip(self.default_save_dir)
             else:
-                self.annotation_dir_label.setText('保存目录: 未设置')
+                self.annotation_dir_label.setText('未设置')
+                self.annotation_dir_label.setToolTip('')
         
         # 同时更新今日总计数标签
         self.update_daily_total_label()
@@ -2379,7 +3324,7 @@ class MainWindow(QMainWindow, WindowMixin):
         if not hasattr(self, 'daily_total_label'):
             return
             
-        stats = self.settings.get(SETTING_DAILY_STATS, {})
+        stats = self.daily_stats
         from datetime import datetime
         today_str = datetime.now().strftime("%Y-%m-%d")
         
@@ -2410,7 +3355,7 @@ def get_main_app(argv=[]):
     """
     app = QApplication(argv)
     app.setApplicationName(__appname__)
-    app.setWindowIcon(new_icon("app"))
+    app.setWindowIcon(new_icon('labelimg'))
     # Tzutalin 201705+: Accept extra agruments to change predefined class file
     argparser = argparse.ArgumentParser()
     argparser.add_argument("image_dir", nargs="?")
@@ -2424,8 +3369,11 @@ def get_main_app(argv=[]):
     args.class_file = args.class_file and os.path.normpath(args.class_file)
     args.save_dir = args.save_dir and os.path.normpath(args.save_dir)
 
-    # Apply modern UI theme
-    apply_theme(app)
+    # Apply themed UI before the main window shows.
+    startup_settings = Settings()
+    startup_settings.load()
+    theme_name = startup_settings.get('theme', CURRENT_THEME)
+    apply_theme(app, theme_name)
 
     # Usage : labelImg.py image classFile saveDir
     win = MainWindow(args.image_dir,

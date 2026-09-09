@@ -5,11 +5,14 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.learnings/
 
 # Distribution / packaging
 build/
+build-*/
 develop-eggs/
 dist/
+dist-*/
 downloads/
 eggs/
 .eggs/
@@ -22,6 +25,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*_extracted/
+
+# Local release artifacts
+release/
+node_cache/
+nul
 
 # IDE
 .idea/
@@ -34,13 +43,9 @@ labelImg.spec
 labelImg.exe
 labelImg_mod.exe
 labelImg_plus.exe
+img/labelimg-preview.png
 
 # Debug files
 test_*.py
 run_debug.py
 crash_log.txt
-
-# Docs
-项目复盘与技术沉淀.md
-功能说明.md
-使用说明.md
