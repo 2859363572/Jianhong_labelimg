@@ -800,8 +800,13 @@ class MainWindow(QMainWindow, WindowMixin):
         sam_action.setShortcut('Ctrl+Shift+Y')
         sam_action.triggered.connect(self.show_sam_dialog)
 
+        from libs.sam3_dialog import SAM3Controller
+        self.sam3_controller = SAM3Controller(self)
+        sam3_action = QAction('SAM3 API 预标注', self)
+        sam3_action.triggered.connect(self.sam3_controller.show)
+
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, None, yolo_predict_action, sam_action, quit))
+                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, None, yolo_predict_action, sam_action, sam3_action, self.sam3_controller.manual_action, self.sam3_controller.cancel_action, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut, custom_shortcut, show_stats))
         add_actions(self.menus.view, (
             self.auto_saving,
@@ -1342,6 +1347,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.statusBar().showMessage(message, delay)
 
     def reset_state(self, reset_navigation=True):
+        if hasattr(self, 'sam3_controller'):
+            self.sam3_controller.invalidate_frame()
         self.items_to_shapes.clear()
         self.shapes_to_items.clear()
         self.label_list.clear()
@@ -2159,7 +2166,8 @@ class MainWindow(QMainWindow, WindowMixin):
         bar.setValue(int(bar.value() + bar.singleStep() * units))
 
     def eventFilter(self, watched, event):
-        if watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
+        if (hasattr(self, 'scroll_area') and watched is self.scroll_area.viewport()
+                and event.type() == QEvent.Wheel):
             if event.modifiers() & Qt.ControlModifier:
                 delta = event.angleDelta().y() if hasattr(event, 'angleDelta') else event.delta()
                 if delta:
@@ -2473,10 +2481,13 @@ class MainWindow(QMainWindow, WindowMixin):
         else:
             xml_path = os.path.splitext(file_path)[0] + XML_EXT
             txt_path = os.path.splitext(file_path)[0] + TXT_EXT
+            json_path = os.path.splitext(file_path)[0] + JSON_EXT
             if os.path.isfile(xml_path):
                 self.load_pascal_xml_by_filename(xml_path)
             elif os.path.isfile(txt_path):
                 self.load_yolo_txt_by_filename(txt_path)
+            elif os.path.isfile(json_path):
+                self.load_create_ml_json_by_filename(json_path, file_path)
 
     def resizeEvent(self, event):
         if self.canvas and not self.image.isNull()\
@@ -2527,8 +2538,12 @@ class MainWindow(QMainWindow, WindowMixin):
         return w / self.canvas.pixmap.width()
 
     def closeEvent(self, event):
+        if not self.sam3_controller.can_close():
+            event.ignore()
+            return
         if not self.may_continue():
             event.ignore()
+            return
         settings = self.settings
         # If it loads images from dir, don't load it at the beginning
         if self.dir_name is None:
@@ -3080,10 +3095,34 @@ class MainWindow(QMainWindow, WindowMixin):
         if os.path.isfile(json_path) is False:
             return
 
+        import json
+        import math
+        try:
+            with open(json_path, 'r') as source:
+                records = json.load(source)
+            if not isinstance(records, list):
+                raise ValueError('Expected a CreateML record list')
+            for record in records:
+                if (not isinstance(record, dict) or not isinstance(record.get('image'), str)
+                        or not isinstance(record.get('annotations'), list)):
+                    raise ValueError('Invalid CreateML record')
+                for annotation in record['annotations']:
+                    if not isinstance(annotation, dict) or not isinstance(annotation.get('label'), str):
+                        raise ValueError('Invalid CreateML annotation')
+                    coords = annotation.get('coordinates')
+                    if not isinstance(coords, dict):
+                        raise ValueError('Missing CreateML coordinates')
+                    for key in ('x', 'y', 'width', 'height'):
+                        value = coords.get(key)
+                        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                                or not math.isfinite(value)):
+                            raise ValueError('Invalid CreateML coordinates')
+            create_ml_parse_reader = CreateMLReader(json_path, file_path)
+            shapes = create_ml_parse_reader.get_shapes()
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+            self.status('无法载入 CreateML 标注：{}'.format(exc), 15000)
+            return
         self.set_format(FORMAT_CREATEML)
-
-        create_ml_parse_reader = CreateMLReader(json_path, file_path)
-        shapes = create_ml_parse_reader.get_shapes()
         self.load_labels(shapes)
         self.canvas.verified = create_ml_parse_reader.verified
 

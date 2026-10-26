@@ -49,7 +49,22 @@ class YOLOWriter:
 
         return class_index, x_center, y_center, w, h
 
-    def save(self, class_list=[], target_file=None):
+    def save(self, class_list=None, target_file=None):
+        # Dataset IDs come from its existing map, not the GUI label-history order.
+        output_path = target_file if target_file is not None else self.filename + TXT_EXT
+        classes_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), 'classes.txt')
+        if os.path.exists(classes_path):
+            with open(classes_path, 'r') as existing:
+                stable_classes = existing.read().splitlines()
+            if (len(set(stable_classes)) != len(stable_classes)
+                    or any(not name.strip() or name != name.strip() for name in stable_classes)):
+                raise ValueError('Invalid existing YOLO class map')
+        else:
+            stable_classes = list(class_list or [])
+        for box in self.box_list:
+            if box['name'] not in stable_classes:
+                stable_classes.append(box['name'])
+        class_list = stable_classes
 
         out_file = None  # Update yolo .txt
         out_class_file = None   # Update class list .txt
